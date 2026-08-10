@@ -212,7 +212,16 @@ def _compute_liquidity_score(df: pd.DataFrame) -> pd.Series:
 
     amount = pd.to_numeric(df["amount"], errors="coerce")
     log_amount = np.log10(amount.clip(lower=1))
-    return _rank_score(log_amount.where(amount > 0), lower_is_better=False, na_score=20)
+    amount_score = _rank_score(
+        log_amount.where(amount > 0), lower_is_better=False, na_score=20
+    )
+    if "bid_ask_spread_bps" not in df.columns:
+        return amount_score
+    spread = pd.to_numeric(df["bid_ask_spread_bps"], errors="coerce")
+    spread_score = _rank_score(
+        spread.where(spread >= 0), lower_is_better=True, na_score=50
+    )
+    return (amount_score * 0.8 + spread_score * 0.2).clip(0, 100)
 
 
 def _compute_momentum_score(df: pd.DataFrame, profile: dict[str, float]) -> pd.Series:

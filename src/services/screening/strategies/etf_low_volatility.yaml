@@ -1,0 +1,45 @@
+# Derived from AlphaSift revision 9f522747caafd3c0b1ddb7e14d5cf44c8580b6cf.
+# Licensed under Apache-2.0 and modified for daily_stock_analysis.
+name: etf_low_volatility
+display_name: ETF 低波稳健
+description: 在境内股票指数 ETF 中筛选波动、回撤和 ATR 受控的主题代表。
+version: "1"
+category: etf
+tags: [etf, low_volatility, defensive]
+analysis_skills: []
+style:
+  risk_profile: conservative
+  holding_period: swing
+  execution_style: low_volatility
+  market_regime: [range, defensive]
+  capital_profile: liquid
+  ui_badge: ETF稳健
+screening:
+  enabled: true
+  market_scope: [cn_etf]
+  hard_filters:
+    exclude_st: false
+    amount_min: 30000000
+    volatility_20d_pct_max: 25
+    max_drawdown_20d_pct_min: -8
+    atr_20_pct_max: 3.5
+    signal_score_min: 50
+  factor_weights:
+    stability: 0.50
+    liquidity: 0.30
+    momentum: 0.20
+  scoring_profile:
+    stability_invalid_pe_penalty: 0
+  risk_profile:
+    invalid_pe_points: 0
+    high_pb_points: 0
+  portfolio_profile:
+    concentration_penalty: 0
+  scorecard_profile:
+    value_quality_bonus: 0
+    capital_confirmed_bonus: 0
+    catalyst_bonus: 0
+    catalyst_bonus_cap: 0
+  ranking_hints: |
+    优先比较低波动、低回撤、低 ATR、成交额和数据质量；缺失的 ETF 专有字段保持未知。
+  max_output: 5

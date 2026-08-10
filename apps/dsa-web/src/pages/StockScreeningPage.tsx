@@ -40,7 +40,10 @@ import {
 import { formatParsedApiError, getParsedApiError, toApiErrorMessage, type ParsedApiError } from '../api/error';
 import { AppPage, Button, InlineAlert, Select } from '../components/common';
 
-const MARKETS = [{ id: 'cn', label: 'A 股' }];
+const MARKETS = [
+  { id: 'cn', label: 'A 股' },
+  { id: 'cn_etf', label: 'A 股 ETF' },
+];
 const SCREEN_TASK_STORAGE_KEY = 'dsa.screening.activeScreenTask.v1';
 const SCREEN_TASK_POLL_INTERVAL_MS = 2000;
 const CUSTOM_STRATEGY_OPTION_VALUE = '__custom_strategy__';
@@ -52,6 +55,7 @@ const STRATEGY_CATEGORY_LABELS: Record<string, string> = {
   reversal: '反转',
   trend: '趋势',
   value: '价值',
+  etf: 'ETF',
 };
 
 const formatStrategyCategory = (value?: string) => {
@@ -835,7 +839,15 @@ const StockScreeningPage: React.FC = () => {
   const [taskProgress, setTaskProgress] = useState(restoredTask?.taskId ? 10 : 0);
   const [taskMessage, setTaskMessage] = useState(restoredTask?.taskId ? '正在恢复选股任务状态...' : '');
 
-  const selectedStrategy = useMemo(() => strategies.find((item) => item.id === strategy), [strategies, strategy]);
+  const availableStrategies = useMemo(
+    () => strategies.filter((item) => !item.marketScope?.length || item.marketScope.includes(market)),
+    [strategies, market],
+  );
+  const selectedStrategy = useMemo(
+    () => availableStrategies.find((item) => item.id === strategy),
+    [availableStrategies, strategy],
+  );
+  const isEtfMarket = market === 'cn_etf';
   const selectedStrategyTitle = selectedStrategy?.name || selectedStrategy?.title || '自定义策略';
   const selectedStrategyTag = formatStrategyCategory(
     selectedStrategy?.category || selectedStrategy?.tag || selectedStrategy?.tags?.[0],
@@ -861,6 +873,12 @@ const StockScreeningPage: React.FC = () => {
     setScreenMeta(result);
     setCandidates(nextCandidates);
     setExpandedCode(nextCandidates[0]?.code ?? null);
+    if (result.market) {
+      setMarket(result.market);
+    }
+    if (result.strategy) {
+      setStrategy(result.strategy);
+    }
   }, []);
 
   const clearScreeningResults = () => {
@@ -942,11 +960,6 @@ const StockScreeningPage: React.FC = () => {
       const result = await screeningApi.getStrategies();
       const loadedStrategies = result.strategies || [];
       setStrategies(loadedStrategies);
-      if (loadedStrategies.length > 0) {
-        setStrategy((currentStrategy) =>
-          loadedStrategies.some((item) => item.id === currentStrategy) ? currentStrategy : loadedStrategies[0].id,
-        );
-      }
     } catch (err) {
       setStrategies([]);
       setStrategyLoadError(err instanceof Error ? err.message : '策略列表加载失败');
@@ -1218,6 +1231,12 @@ const StockScreeningPage: React.FC = () => {
       clearScreeningResults();
     }
     setMarket(nextMarket);
+    const firstStrategy = strategies.find(
+      (item) => !item.marketScope?.length || item.marketScope.includes(nextMarket),
+    );
+    if (firstStrategy) {
+      setStrategy(firstStrategy.id);
+    }
   };
 
   const handleMaxResultsChange = (nextMaxResults: number) => {
@@ -1290,7 +1309,7 @@ const StockScreeningPage: React.FC = () => {
 
       {error ? <InlineAlert variant="danger" title="调用失败" message={error} /> : null}
 
-      <section className="rounded-2xl border border-border/80 bg-card/95 p-4 shadow-soft-card">
+      {!isEtfMarket ? <section className="rounded-2xl border border-border/80 bg-card/95 p-4 shadow-soft-card">
         <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div className="flex items-start gap-3">
             <span className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-orange-500/10 text-orange-500 shadow-[0_10px_30px_rgba(249,115,22,0.16)]">
@@ -1536,7 +1555,7 @@ const StockScreeningPage: React.FC = () => {
             ) : null}
           </div>
         ) : null}
-      </section>
+      </section> : null}
 
       <section className="rounded-2xl border border-cyan/35 bg-card/95 p-4 shadow-soft-card">
         <div className="mb-4 flex items-start justify-between gap-3">
@@ -1549,7 +1568,7 @@ const StockScreeningPage: React.FC = () => {
           </span>
         </div>
 
-        <div className="grid gap-4 lg:grid-cols-[1fr_1.2fr_180px_auto] lg:items-end">
+        <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_160px_auto] 2xl:items-end">
           <label className="space-y-2 text-xs font-medium text-secondary-text">
             市场
             <select
@@ -1574,7 +1593,7 @@ const StockScreeningPage: React.FC = () => {
               disabled={loading || loadingStrategies}
               placeholder=""
               options={[
-                ...strategies.map((item) => ({
+                ...availableStrategies.map((item) => ({
                   value: item.id,
                   label: item.name || item.title || item.id,
                 })),
@@ -1674,7 +1693,9 @@ const StockScreeningPage: React.FC = () => {
                 </span>
               ) : null}
               <span>
-                深度补充：{screenMeta?.dsaEnrichment?.enrichedCount ?? '-'} / {screenMeta?.dsaEnrichment?.requestedCount ?? '-'}
+                {isEtfMarket
+                  ? `市场池：${screenMeta?.universeMode || '-'}`
+                  : `深度补充：${screenMeta?.dsaEnrichment?.enrichedCount ?? '-'} / ${screenMeta?.dsaEnrichment?.requestedCount ?? '-'}`}
               </span>
             </div>
           </details>
@@ -1711,7 +1732,7 @@ const StockScreeningPage: React.FC = () => {
                   <th className="w-14 px-4 py-3 font-semibold">#</th>
                   <th className="px-4 py-3 font-semibold">代码</th>
                   <th className="px-4 py-3 font-semibold">名称</th>
-                  <th className="px-4 py-3 font-semibold">行业</th>
+                  <th className="px-4 py-3 font-semibold">{isEtfMarket ? '主题' : '行业'}</th>
                   <th className="px-4 py-3 font-semibold">价格</th>
                   <th className="px-4 py-3 font-semibold">涨跌幅</th>
                   <th className="px-4 py-3 font-semibold">评分</th>
@@ -1734,7 +1755,7 @@ const StockScreeningPage: React.FC = () => {
                         <td className="px-4 py-3 text-secondary-text">{item.rank}</td>
                         <td className="px-4 py-3 font-mono font-semibold text-foreground">{item.code}</td>
                         <td className="px-4 py-3 font-semibold text-foreground">{item.name || '-'}</td>
-                        <td className="px-4 py-3 text-secondary-text">{item.industry || '-'}</td>
+                        <td className="px-4 py-3 text-secondary-text">{isEtfMarket ? item.themeName || '-' : item.industry || '-'}</td>
                         <td className="px-4 py-3 text-secondary-text">{formatNumber(item.price)}</td>
                         <td className="px-4 py-3 text-secondary-text">{formatNumber(item.changePct)}%</td>
                         <td className="px-4 py-3 font-bold text-cyan">{formatScore(item.score)}</td>
@@ -1766,13 +1787,13 @@ const StockScreeningPage: React.FC = () => {
                                 <div>
                                   <p className="text-xs font-semibold text-secondary-text">操作信号</p>
                                   <p className="mt-1 text-sm text-foreground">{getSignal(item)}</p>
-                                  <button
+                                  {!isEtfMarket ? <button
                                     className="mt-2 rounded-lg border border-cyan/40 px-3 py-1.5 text-xs font-semibold text-cyan transition-colors hover:bg-cyan/10"
                                     type="button"
                                     onClick={() => handleAnalyzeCandidate(item)}
                                   >
                                     进一步深度分析
-                                  </button>
+                                  </button> : null}
                                 </div>
                                 {item.dsaAnalysisSummary ? (
                                   <div>

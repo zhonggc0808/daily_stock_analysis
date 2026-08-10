@@ -969,7 +969,7 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('选股已开启')).toBeInTheDocument();
 
     const marketSelect = screen.getByLabelText('市场') as HTMLSelectElement;
-    expect(Array.from(marketSelect.options).map((option) => option.value)).toEqual(['cn']);
+    expect(Array.from(marketSelect.options).map((option) => option.value)).toEqual(['cn', 'cn_etf']);
 
     const strategySelect = screen.getByLabelText('策略') as HTMLSelectElement;
     expect(Array.from(strategySelect.options).map((option) => option.textContent)).toEqual([
@@ -1346,5 +1346,53 @@ describe('StockScreeningPage', () => {
     expect(screen.getByText('贵州茅台最新公告')).toBeInTheDocument();
     expect(screen.getByText('数据补充提示')).toBeInTheDocument();
     expect(screen.getByText('stock_news_unavailable')).toBeInTheDocument();
+  });
+
+  it('filters ETF strategies, displays themes, and hides stock-only actions', async () => {
+    getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
+    getStrategies.mockResolvedValueOnce({
+      enabled: true,
+      strategies: [
+        { ...mockStrategiesResponse.strategies[0] },
+        {
+          id: 'etf_trend',
+          name: 'ETF 趋势',
+          description: 'ETF trend',
+          category: 'etf',
+          marketScope: ['cn_etf'],
+        },
+      ],
+      strategyCount: 2,
+    });
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      market: 'cn_etf',
+      strategy: 'etf_trend',
+      candidates: [{
+        rank: 1,
+        code: '512480',
+        name: '半导体ETF',
+        assetType: 'etf',
+        themeName: '半导体',
+        score: 88,
+        reason: '趋势稳定',
+        raw: {},
+      }],
+      candidateCount: 1,
+      universeMode: 'authoritative',
+    });
+
+    render(<StockScreeningPage />);
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('市场'), { target: { value: 'cn_etf' } });
+
+    await waitFor(() => expect((screen.getByLabelText('策略') as HTMLSelectElement).value).toBe('etf_trend'));
+    expect(screen.queryByText('热点题材')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+
+    expect(await screen.findByText('半导体ETF')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '主题' })).toBeInTheDocument();
+    expect(screen.getByText('半导体')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '进一步深度分析' })).not.toBeInTheDocument();
   });
 });

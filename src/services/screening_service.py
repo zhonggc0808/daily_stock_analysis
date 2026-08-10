@@ -894,6 +894,7 @@ class ScreeningService:
             "strategy_count": engine_status.get("strategy_count"),
             "reference_project": engine_status.get("reference_project"),
             "reference_revision": engine_status.get("reference_revision"),
+            "supported_markets": engine_status.get("supported_markets") or ["cn", "cn_etf"],
         }
         source_health = _get_screening_source_health_snapshot()
         if source_health:
@@ -1255,12 +1256,20 @@ class ScreeningService:
 
         candidates = _normalize_candidates(raw_data)
         selected = candidates[:max_results]
-        _emit_screening_progress(
-            progress_callback,
-            92,
-            "正在补充入选股票的新闻与事件",
-        )
-        selected, dsa_enrichment = _enrich_candidates_with_dsa(selected)
+        if market == "cn_etf":
+            dsa_enrichment = {
+                "enabled": False,
+                "requested_count": 0,
+                "enriched_count": 0,
+                "warnings": [],
+            }
+        else:
+            _emit_screening_progress(
+                progress_callback,
+                92,
+                "正在补充入选股票的新闻与事件",
+            )
+            selected, dsa_enrichment = _enrich_candidates_with_dsa(selected)
         warnings = _collect_screening_warning_messages(raw_data)
         response = {
             "enabled": True,
@@ -1287,6 +1296,10 @@ class ScreeningService:
             "degradation": _list_text_values(raw_data.get("degradation")),
             "warnings": warnings,
             "source_errors": _list_text_values(raw_data.get("source_errors")),
+            "universe_source": raw_data.get("universe_source") or "",
+            "universe_mode": raw_data.get("universe_mode") or "",
+            "unclassified_count": raw_data.get("unclassified_count") or 0,
+            "exclusion_counts": raw_data.get("exclusion_counts") or {},
             "dsa_enrichment": dsa_enrichment,
             "deep_analysis_requested": raw_data.get("deep_analysis_requested"),
             "post_analyzers": raw_data.get("post_analyzers") or [],
@@ -1564,6 +1577,7 @@ def _call_screening_status() -> Dict[str, Any]:
         "strategy_count": strategy_count,
         "reference_project": REFERENCE_PROJECT,
         "reference_revision": REFERENCE_REVISION,
+        "supported_markets": ["cn", "cn_etf"],
     }
 
 
@@ -1801,7 +1815,19 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
         retries: int = 2,
         cache_dir: str | Path | None = None,
         cache_ttl_seconds: float | None = None,
+        market: str = "cn",
     ) -> Any:
+        if str(market).strip().lower() == "cn_etf":
+            return original_fetch(
+                code,
+                lookback_days=lookback_days,
+                source=source,
+                retries=retries,
+                cache_dir=cache_dir,
+                cache_ttl_seconds=cache_ttl_seconds,
+                market=market,
+            )
+
         try:
             dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
             normalized = _normalize_dsa_daily_history(dsa_df)
@@ -1850,6 +1876,7 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
             retries=retries,
             cache_dir=cache_dir,
             cache_ttl_seconds=cache_ttl_seconds,
+            market=market,
         )
 
     return fetch_daily_history_with_dsa
@@ -3773,6 +3800,14 @@ def _normalize_candidate(raw: Any, rank: int) -> Dict[str, Any]:
         "change_pct": _first_present(item, source, "change_pct"),
         "amount": _first_present(item, source, "amount"),
         "industry": item.get("industry") or source.get("industry") or "",
+        "asset_type": item.get("asset_type") or source.get("asset_type") or "stock",
+        "fund_type": item.get("fund_type") or source.get("fund_type") or "",
+        "fund_size": _first_present(item, source, "fund_size"),
+        "theme_key": item.get("theme_key") or source.get("theme_key") or "",
+        "theme_name": item.get("theme_name") or source.get("theme_name") or "",
+        "bid_ask_spread_bps": _first_present(item, source, "bid_ask_spread_bps"),
+        "universe_mode": item.get("universe_mode") or source.get("universe_mode") or "",
+        "daily_adjustment": item.get("daily_adjustment") or source.get("daily_adjustment") or "",
         "factor_scores": item.get("factor_scores") or source.get("factor_scores") or {},
         "dsa_context": dsa_context,
         "dsa_news": dsa_news,

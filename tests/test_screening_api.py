@@ -3440,6 +3440,39 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
         self.assertIs(daily_module.fetch_daily_history, builtin_fetch)
 
+    def test_etf_daily_history_bridge_skips_stock_dsa_loader(self) -> None:
+        import src.services.screening.daily as daily_module
+
+        expected = pd.DataFrame([{"date": "2026-06-03", "close": 1.0}])
+        direct_fetch = MagicMock(return_value=expected)
+        with (
+            patch.object(daily_module, "fetch_daily_history", new=direct_fetch),
+            patch("src.services.screening_service.get_dsa_daily_history") as dsa_fetch,
+        ):
+            daily_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
+            self.assertIsNotNone(daily_fetcher)
+            result = daily_fetcher(
+                "510300",
+                lookback_days=90,
+                source="auto",
+                retries=1,
+                cache_dir=Path("data/screening/daily_history"),
+                cache_ttl_seconds=321.0,
+                market="cn_etf",
+            )
+
+        self.assertIs(result, expected)
+        dsa_fetch.assert_not_called()
+        direct_fetch.assert_called_once_with(
+            "510300",
+            lookback_days=90,
+            source="auto",
+            retries=1,
+            cache_dir=Path("data/screening/daily_history"),
+            cache_ttl_seconds=321.0,
+            market="cn_etf",
+        )
+
     def test_fetch_daily_history_wraps_tencent_and_sina_with_daily_timeout(self) -> None:
         import src.services.screening.daily as daily_module
 

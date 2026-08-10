@@ -132,6 +132,13 @@ class Pick:
     pb_ratio: float | None = None
     industry: str = ""
     concepts: str = ""
+    asset_type: str = "stock"
+    fund_type: str = ""
+    fund_size: float | None = None
+    theme_key: str = ""
+    theme_name: str = ""
+    bid_ask_spread_bps: float | None = None
+    universe_mode: str = ""
     industry_rank: int | None = None
     industry_change_pct: float | None = None
     industry_heat_score: float | None = None
@@ -162,6 +169,7 @@ class Pick:
     daily_quality_score: float | None = None
     daily_quality_flags: str = ""
     daily_source: str = ""
+    daily_adjustment: str = ""
     factor_scores: dict[str, float] = field(default_factory=dict)
     llm_confidence: float | None = None
     llm_sector: str = ""
@@ -223,6 +231,10 @@ class ScreenResult:
     degradation: list[str] = field(default_factory=list)
     snapshot_source: str = ""
     source_errors: list[str] = field(default_factory=list)
+    universe_source: str = ""
+    universe_mode: str = ""
+    unclassified_count: int = 0
+    exclusion_counts: dict[str, int] = field(default_factory=dict)
     deep_analysis_requested: bool = False
     post_analyzers: list[str] = field(default_factory=list)
     daily_enriched: bool = False

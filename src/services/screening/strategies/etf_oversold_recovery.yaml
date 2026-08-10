@@ -1,0 +1,46 @@
+# Derived from AlphaSift revision 9f522747caafd3c0b1ddb7e14d5cf44c8580b6cf.
+# Licensed under Apache-2.0 and modified for daily_stock_analysis.
+name: etf_oversold_recovery
+display_name: ETF 超跌修复
+description: 在境内股票指数 ETF 中筛选超跌后具备修复信号和流动性的主题代表。
+version: "1"
+category: etf
+tags: [etf, oversold, reversal]
+analysis_skills: []
+style:
+  risk_profile: aggressive
+  holding_period: swing
+  execution_style: reversal
+  market_regime: [reversal, rotation]
+  capital_profile: liquid
+  ui_badge: ETF修复
+screening:
+  enabled: true
+  market_scope: [cn_etf]
+  hard_filters:
+    exclude_st: false
+    amount_min: 30000000
+    change_60d_min: -30
+    change_60d_max: 5
+    rsi_status_whitelist: [oversold]
+    macd_status_whitelist: [neutral, bullish]
+    signal_score_min: 40
+  factor_weights:
+    reversal: 0.50
+    liquidity: 0.30
+    stability: 0.20
+  scoring_profile:
+    stability_invalid_pe_penalty: 0
+  risk_profile:
+    invalid_pe_points: 0
+    high_pb_points: 0
+  portfolio_profile:
+    concentration_penalty: 0
+  scorecard_profile:
+    value_quality_bonus: 0
+    capital_confirmed_bonus: 0
+    catalyst_bonus: 0
+    catalyst_bonus_cap: 0
+  ranking_hints: |
+    优先比较超跌程度、修复信号、成交额、价差和数据质量，不推断公司事件或 ETF 缺失字段。
+  max_output: 5

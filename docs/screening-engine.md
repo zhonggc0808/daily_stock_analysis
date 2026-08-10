@@ -14,6 +14,18 @@ DSA 将选股能力作为主项目的一部分维护。实现参考 [AlphaSift](
 
 服务层静态调用 `screening.pipeline`、`screening.strategy` 和 `screening.hotspot`。核心逻辑不通过模块名探测、动态适配器或多套路由分发，因此代码结构、错误边界和打包收集目标均由主项目直接定义。
 
+## A 股 ETF 独立市场池
+
+`cn_etf` 只接纳沪深上市、底层为境内 A 股的股票指数 ETF。上交所资格要求 `ETF类型` 为“单市”或“跨市”，深交所资格要求 `基金类别=ETF` 且 `投资类别=股票基金`；基金分类会做交叉校验，港股、恒生、沪港深、海外、货币、债券和商品暴露会被排除。“标普中国 A 股”等境内指数不会因指数提供商名称被误排。
+
+分类源异常时依次使用资格缓存、交易所缓存和严格主题正向词典。不能明确识别的标的不进入池，但不会中止整批任务。结果通过 `universe_source`、`universe_mode`、`unclassified_count` 和 `exclusion_counts` 区分权威模式与保守降级模式。
+
+ETF 快照链为 `Sina ETF -> AkShare ETF -> cn_etf last-good`。日线自动链为 `Tencent qfq -> Sina unadjusted -> AkShare fund_etf_hist_em(qfq)`，不使用 Baostock；显式 Tushare 路径调用 `fund_daily`。新浪未复权日线标记 `unadjusted_fallback`，快照、资格和日线缓存均与普通 A 股隔离。
+
+硬筛选后先按细分 `theme_key` 保留前三只，再把日线增强池限制为全局 60 只。最终评分后每个主题只保留一只，同分依次按成交额、基金规模和代码裁决；主题不足时允许少于请求数量，并记录 `insufficient_distinct_themes`。ETF 不执行公司基本面、公告、个股新闻、DSA 深度分析或大盘上下文流程。
+
+内置策略为 `etf_trend`、`etf_low_volatility` 和 `etf_oversold_recovery`。LLM 只接收实际存在的主题、成交额、价差、规模、趋势、波动、回撤与数据质量；费率和跟踪误差等缺失字段保持未知。
+
 ## 配置
 
 默认关闭：
@@ -93,8 +105,8 @@ Web 会在浏览器本地生成一个不含用户信息的匿名种子，并随�
 
 | 数据 | 位置 | 有效期/行为 |
 | --- | --- | --- |
-| 全市场快照 | `data/screening/snapshot.last_good.json` | 默认 5 分钟内直接复用且不标记 fallback；过期后请求实时源，实时源全部失败时仍可按最大陈旧时间约束回退并标记 stale/fallback |
-| 个股日 K | `data/screening/daily_history/` | 按代码、来源和回看窗口分键，默认 TTL 24 小时；实时源全部失败时可使用过期缓存并标记 stale |
+| 全市场快照 | `data/screening/snapshot.last_good.json`、`snapshot.last_good_cn_etf.json` | 普通 A 股与 ETF 独立命名；默认 5 分钟内复用，实时源失败时按最大陈旧时间约束回退 |
+| 个股/ETF 日 K | `data/screening/daily_history/`、`data/screening/daily_history/cn_etf/` | 普通 A 股保留原路径，ETF 使用独立子目录；按代码、来源和回看窗口分键，默认 TTL 24 小时 |
 | 行业/概念映射 | `data/screening/industry_provider_cache/` | 默认 TTL 24 小时，并保存板块热度历史用于趋势计算 |
 | 热点列表与历史 | `data/screening/hotspots.json`、`hotspot.history.jsonl` | 显式刷新写入；实时失败时回退最近可用快照 |
 | 热点详情 | `data/screening/hotspot_details/` | 默认 TTL 30 分钟；只缓存结构化基础详情，显式消息搜索不写入或续期该缓存；实时失败时可回退过期详情并返回陈旧时长 |

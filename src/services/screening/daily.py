@@ -8,6 +8,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,7 @@ _DAILY_FEATURE_DEFAULTS = {
     "daily_quality_score": pd.NA,
     "daily_quality_flags": "",
     "daily_source": "",
+    "daily_adjustment": "",
 }
 _DAILY_ENRICH_MAX_WORKERS = 1
 _DAILY_HISTORY_CACHE_VERSION = 1
@@ -70,6 +72,7 @@ def enrich_daily_features(
     cache_ttl_seconds: float | None = None,
     max_workers: int | None = None,
     history_fetcher: Callable[..., pd.DataFrame] | None = None,
+    market: str = "cn",
 ) -> pd.DataFrame:
     """Attach daily technical features to the first ``max_rows`` candidates.
 
@@ -89,6 +92,7 @@ def enrich_daily_features(
     daily_source_health: dict[str, object] = {}
     success_count = 0
     fetch_history = history_fetcher or fetch_daily_history
+    fetcher_accepts_market = history_fetcher is None or _accepts_keyword(fetch_history, "market")
     selected_index = list(result.index[:max_rows])
     fetch_requests: list[tuple[object, str]] = []
     for idx in selected_index:
@@ -101,16 +105,19 @@ def enrich_daily_features(
     def fetch_one(request: tuple[object, str]) -> tuple[object, dict[str, object], str | None, dict[str, object]]:
         idx, code = request
         try:
-            hist = fetch_history(
-                code,
-                lookback_days=lookback_days,
-                source=source,
-                retries=fetch_retries,
-                cache_dir=cache_dir,
-                cache_ttl_seconds=cache_ttl_seconds,
-            )
+            kwargs = {
+                "lookback_days": lookback_days,
+                "source": source,
+                "retries": fetch_retries,
+                "cache_dir": cache_dir,
+                "cache_ttl_seconds": cache_ttl_seconds,
+            }
+            if fetcher_accepts_market:
+                kwargs["market"] = market
+            hist = fetch_history(code, **kwargs)
             features = compute_daily_features(hist)
             features["daily_source"] = str(hist.attrs.get("daily_source", ""))
+            features["daily_adjustment"] = str(hist.attrs.get("daily_adjustment", ""))
             metadata = {
                 "daily_source": features["daily_source"],
                 "daily_quality_flags": features.get("daily_quality_flags", ""),
@@ -171,22 +178,25 @@ def fetch_daily_history(
     retries: int = 2,
     cache_dir: str | Path | None = None,
     cache_ttl_seconds: float | None = None,
+    market: str = "cn",
 ) -> pd.DataFrame:
     """Fetch daily history for one stock code.
 
     ``source`` accepts ``tencent``, ``sina``, ``akshare``, ``baostock``, ``tushare``,
-    ``yfinance`` or ``auto``. ``auto`` prefers Tushare when a token is
-    configured, then Tencent's direct HTTP K-line endpoint before wrapper-based
-    free sources. Without a token it starts with Tencent. Sina is a second
-    direct HTTP K-line source before wrapper-based fallbacks. ``yfinance`` is
-    explicit-only (never part of ``auto``) and expects a US ticker rather than
-    an A-share code.
+    ``yfinance`` or ``auto``. For stocks, ``auto`` prefers Tushare when a token
+    is configured. For ETFs, the fixed chain is Tencent, Sina, then AkShare;
+    Tushare remains explicit-only because ``fund_daily`` is unadjusted.
+    ``yfinance`` is explicit-only (never part of ``auto``) and expects a US
+    ticker rather than an A-share code.
     """
     normalized_code = _normalize_daily_code(code)
     normalized_lookback_days = int(lookback_days)
     src = _normalize_daily_source(source)
+    is_etf = str(market).strip().lower() == "cn_etf"
+    if is_etf and src == "baostock":
+        raise ValueError("Baostock is not an ETF daily source")
     if src == "auto":
-        sources: tuple[str, ...] = (
+        sources: tuple[str, ...] = ("tencent", "sina", "akshare") if is_etf else (
             ("tushare", "tencent", "sina", "akshare", "baostock")
             if _has_tushare_token()
             else ("tencent", "sina", "akshare", "baostock")
@@ -205,6 +215,7 @@ def fetch_daily_history(
             code=normalized_code,
             source=src,
             lookback_days=normalized_lookback_days,
+            market=market,
         )
         cached = _read_daily_history_cache(cache_path, ttl_seconds=cache_ttl_seconds)
         if cached is not None:
@@ -248,6 +259,7 @@ def fetch_daily_history(
                         current,
                         normalized_code,
                         lookback_days=normalized_lookback_days,
+                        is_etf=is_etf,
                     )
                 elif current == "tushare":
                     result = _call_daily_wrapper(
@@ -255,6 +267,7 @@ def fetch_daily_history(
                         current,
                         normalized_code,
                         lookback_days=normalized_lookback_days,
+                        is_etf=is_etf,
                     )
                 else:
                     result = _call_daily_wrapper(
@@ -265,6 +278,9 @@ def fetch_daily_history(
                     )
                 _record_source_success(current, rows=len(result))
                 result.attrs["daily_source"] = current
+                result.attrs["daily_adjustment"] = result.attrs.get(
+                    "daily_adjustment"
+                ) or ("unadjusted_fallback" if current == "sina" else "qfq")
                 result.attrs["daily_requested_source"] = src
                 result.attrs["daily_source_order"] = list(sources)
                 result.attrs["daily_source_order_notes"] = list(source_order_notes)
@@ -326,6 +342,17 @@ def _normalize_max_workers(value: int | None) -> int:
     if value is None:
         return _DAILY_ENRICH_MAX_WORKERS
     return max(1, int(value))
+
+
+def _accepts_keyword(callable_obj: Callable[..., object], keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == keyword
+        for parameter in parameters
+    )
 
 
 def _call_daily_wrapper(fetcher, source: str, *args, **kwargs) -> pd.DataFrame:
@@ -441,12 +468,19 @@ def _daily_history_cache_path(
     code: str,
     source: str,
     lookback_days: int,
+    market: str = "cn",
 ) -> Path:
-    key = f"{code}|{source}|{int(lookback_days)}"
+    namespace = str(market or "cn").strip().lower()
+    key = (
+        f"{code}|{source}|{int(lookback_days)}"
+        if namespace == "cn"
+        else f"{namespace}|{code}|{source}|{int(lookback_days)}"
+    )
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     safe_source = "".join(ch if ch.isalnum() else "-" for ch in source).strip("-") or "source"
     safe_code = "".join(ch if ch.isalnum() else "-" for ch in code).strip("-") or "code"
-    return Path(cache_dir) / f"{safe_code}_{safe_source}_{int(lookback_days)}_{digest}.json"
+    filename = f"{safe_code}_{safe_source}_{int(lookback_days)}_{digest}.json"
+    return Path(cache_dir) / filename if namespace == "cn" else Path(cache_dir) / namespace / filename
 
 
 def _read_daily_history_cache(
@@ -479,7 +513,7 @@ def _read_daily_history_cache(
         df = pd.DataFrame(data, columns=columns)
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health"):
+            for key in ("daily_source", "daily_adjustment", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health"):
                 if key in metadata:
                     df.attrs[key] = metadata[key]
         if is_stale:
@@ -508,6 +542,7 @@ def _write_daily_history_cache(
             },
             "metadata": {
                 "daily_source": df.attrs.get("daily_source", source),
+                "daily_adjustment": df.attrs.get("daily_adjustment", ""),
                 "daily_requested_source": df.attrs.get("daily_requested_source", source),
                 "daily_source_order": list(df.attrs.get("daily_source_order", [])),
                 "daily_source_order_notes": list(df.attrs.get("daily_source_order_notes", [])),
@@ -524,18 +559,21 @@ def _write_daily_history_cache(
         return
 
 
-def _fetch_daily_akshare(code: str, *, lookback_days: int) -> pd.DataFrame:
+def _fetch_daily_akshare(code: str, *, lookback_days: int, is_etf: bool = False) -> pd.DataFrame:
     import akshare as ak
 
     start_date = (datetime.now() - timedelta(days=max(lookback_days * 2, 90))).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
-    df = ak.stock_zh_a_hist(
-        symbol=str(code).zfill(6),
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq",
-    )
+    if is_etf:
+        df = ak.fund_etf_hist_em(
+            symbol=str(code).zfill(6), period="daily",
+            start_date=start_date, end_date=end_date, adjust="qfq",
+        )
+    else:
+        df = ak.stock_zh_a_hist(
+            symbol=str(code).zfill(6), period="daily",
+            start_date=start_date, end_date=end_date, adjust="qfq",
+        )
     if df is None or df.empty:
         raise RuntimeError(f"akshare daily history empty for {code}")
     return df.tail(max(lookback_days, 30)).copy()
@@ -568,7 +606,11 @@ def _fetch_daily_tencent(code: str, *, lookback_days: int) -> pd.DataFrame:
     stock_data = data.get(symbol) if isinstance(data, dict) else None
     if not isinstance(stock_data, dict):
         raise RuntimeError(f"tencent daily history missing payload for {code}")
-    rows = stock_data.get("qfqday") or stock_data.get("day") or []
+    rows = stock_data.get("qfqday") or []
+    adjustment = "qfq"
+    if not rows:
+        rows = stock_data.get("day") or []
+        adjustment = "unadjusted_fallback"
     if not isinstance(rows, list) or not rows:
         raise RuntimeError(f"tencent daily history empty for {code}")
 
@@ -593,6 +635,7 @@ def _fetch_daily_tencent(code: str, *, lookback_days: int) -> pd.DataFrame:
     )
     for col in ("open", "close", "high", "low", "volume", "amount"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.attrs["daily_adjustment"] = adjustment
     return df.tail(count).copy()
 
 
@@ -642,7 +685,7 @@ def _fetch_daily_sina(code: str, *, lookback_days: int) -> pd.DataFrame:
     return df.tail(count).copy()
 
 
-def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
+def _fetch_daily_tushare(code: str, *, lookback_days: int, is_etf: bool = False) -> pd.DataFrame:
     """Fetch forward-adjusted daily history via Tushare Pro."""
     token = _tushare_token()
     if not token:
@@ -655,12 +698,11 @@ def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
 
     start_date = (datetime.now() - timedelta(days=max(lookback_days * 2, 90))).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
-    adj = _normalize_tushare_adj(os.getenv("TUSHARE_DAILY_ADJ", "qfq"))
+    adj = None if is_etf else _normalize_tushare_adj(os.getenv("TUSHARE_DAILY_ADJ", "qfq"))
     ts_code = _to_tushare_code(code)
-    df = pro.daily(
-        ts_code=ts_code,
-        start_date=start_date,
-        end_date=end_date,
+    fetcher = pro.fund_daily if is_etf else pro.daily
+    df = fetcher(
+        ts_code=ts_code, start_date=start_date, end_date=end_date,
         fields="ts_code,trade_date,open,high,low,close,vol,amount",
     )
     if df is None or df.empty:
@@ -676,6 +718,7 @@ def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
         )
 
     normalized = _normalize_tushare_daily_frame(df)
+    normalized.attrs["daily_adjustment"] = "unadjusted_fallback" if is_etf else (adj or "unadjusted")
     return normalized.tail(max(lookback_days, 30)).copy()
 
 
@@ -985,6 +1028,10 @@ def _compute_daily_quality(raw: pd.DataFrame, normalized: pd.DataFrame) -> dict[
     if bool(raw.attrs.get("daily_stale")):
         score -= 25
         flags.append("stale_cache")
+
+    if raw.attrs.get("daily_adjustment") == "unadjusted_fallback":
+        score -= 5
+        flags.append("unadjusted_fallback")
 
     source_errors = list(raw.attrs.get("source_errors", []) or [])
     if source_errors:

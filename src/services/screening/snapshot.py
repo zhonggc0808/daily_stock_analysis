@@ -72,6 +72,21 @@ def fetch_snapshot_with_fallback(
     market: str = "cn",
 ) -> pd.DataFrame:
     """Try live sources, optionally falling back to the last-good snapshot."""
+    if market == "cn_etf":
+        from src.services.screening.snapshot_etf import fetch_etf_snapshot_with_fallback
+
+        universe_cache_dir = (
+            Path(fallback_snapshot_path).parent
+            if fallback_snapshot_path is not None
+            else None
+        )
+        return fetch_etf_snapshot_with_fallback(
+            required_columns=required_columns,
+            fallback_snapshot_path=fallback_snapshot_path,
+            fallback_max_age_hours=fallback_max_age_hours,
+            cache_ttl_seconds=cache_ttl_seconds,
+            universe_cache_dir=universe_cache_dir,
+        )
     if market == "us":
         return _fetch_us_snapshot_with_fallback(required_columns)
 
@@ -266,6 +281,10 @@ def _write_last_good_snapshot(
                 ],
                 "row_count": int(len(df)),
                 "columns": list(df.columns),
+                "universe_source": str(df.attrs.get("universe_source", "")),
+                "universe_mode": str(df.attrs.get("universe_mode", "")),
+                "unclassified_count": int(df.attrs.get("unclassified_count", 0) or 0),
+                "exclusion_counts": dict(df.attrs.get("exclusion_counts", {}) or {}),
             },
             "frame": json.loads(
                 df.to_json(orient="split", date_format="iso", force_ascii=False)
@@ -366,6 +385,10 @@ def _read_last_good_snapshot(
     cached.attrs["last_good_snapshot_source"] = str(
         metadata.get("snapshot_source", "")
     )
+    cached.attrs["universe_source"] = str(metadata.get("universe_source", ""))
+    cached.attrs["universe_mode"] = str(metadata.get("universe_mode", ""))
+    cached.attrs["unclassified_count"] = int(metadata.get("unclassified_count", 0) or 0)
+    cached.attrs["exclusion_counts"] = dict(metadata.get("exclusion_counts", {}) or {})
     if isinstance(metadata, dict):
         cached.attrs["last_good_created_at"] = str(payload.get("created_at", ""))
     if fresh:

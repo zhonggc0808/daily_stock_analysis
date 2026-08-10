@@ -15,12 +15,15 @@
 
 ## 已接入数据源矩阵
 
+2026-08-09 在部署容器复核：新浪 ETF 快照返回 1,624 条、约 4.55 秒；`fund_name_em()` 返回 27,479 条、约 10.22 秒；腾讯 `510300` 前复权日线约 0.44 秒。该结果与首次受控探针一致，因此 ETF 主链保持新浪快照和腾讯日线，东财 ETF 日线只作补充。
+
 | 场景 | 已接入源 | 默认使用方式 | 失败处理 |
 | --- | --- | --- | --- |
 | A 股日线 / 技术面 | Efinance、Tencent、AkShare、Tushare、Pytdx、Baostock、YFinance | `DataFetcherManager` 按优先级尝试；配置 `TUSHARE_TOKEN` 后 Tushare 自动进入候选源 | 单源失败后尝试下一个源；连续失败会短期熔断该源 |
 | A 股实时行情 | Tencent、AkShare Sina、Efinance、AkShare EM、Tushare | `REALTIME_SOURCE_PRIORITY` 控制顺序，默认偏向 Tencent / Sina 这类轻量源 | 失败源记录 `fallback_from`，成功源继续返回 |
 | A 股大盘复盘 | TickFlow、AkShare、Tushare、Efinance | 配置 `TICKFLOW_API_KEY` 后，主指数和市场宽度优先尝试 TickFlow | TickFlow 权限不足或失败时回退 AkShare / Tushare / Efinance 链路 |
 | 选股快照 | Tushare、Sina、Efinance、AkShare EM、EastMoney Datacenter | 有 `TUSHARE_TOKEN` 时自动把 `tushare` 放入快照优先级；否则使用免费源链路 | 选股引擎维护 source health；状态接口透出 snapshot/daily health |
+| A 股 ETF 选股 | Sina ETF、交易所清单、Tencent、Sina 日线、AkShare ETF | 快照优先新浪；日线优先腾讯前复权，新浪未复权仅作显式质量降级，东财链作为补充 | ETF 快照、资格和日线使用 `cn_etf` 独立缓存；日线池全局上限 60 |
 | 选股日线补特征 | `DataFetcherManager` | 选股引擎优先复用现有日线与缓存链路 | 现有链路失败后才回到引擎自身的日线源 |
 | 选股热点题材 | EastMoney provider、参考 AlphaSift 的 hotspot 实现、last-good cache | 未指定 provider 时默认使用 EastMoney provider | 实时失败时回退热点缓存；无缓存时返回稳定空态和可读错误 |
 | 港股 / 美股 | Longbridge、YFinance、AkShare、Tushare、Finnhub、AlphaVantage、Stooq | 配置 Longbridge 凭证后参与港美股日线/实时兜底；YFinance 保持基础兜底 | Longbridge 冷却或失败时回退 YFinance / 其他可用源 |

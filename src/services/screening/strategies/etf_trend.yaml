@@ -1,0 +1,47 @@
+# Derived from AlphaSift revision 9f522747caafd3c0b1ddb7e14d5cf44c8580b6cf.
+# Licensed under Apache-2.0 and modified for daily_stock_analysis.
+name: etf_trend
+display_name: ETF 趋势
+description: 在境内股票指数 ETF 中筛选趋势、流动性和稳定性兼备的主题代表。
+version: "1"
+category: etf
+tags: [etf, trend, liquidity]
+analysis_skills: []
+style:
+  risk_profile: balanced
+  holding_period: swing
+  execution_style: trend
+  market_regime: [trend, rotation]
+  capital_profile: liquid
+  ui_badge: ETF趋势
+screening:
+  enabled: true
+  market_scope: [cn_etf]
+  hard_filters:
+    exclude_st: false
+    amount_min: 50000000
+    change_60d_min: 0
+    change_60d_max: 40
+    require_ma_bullish: true
+    require_price_above_ma20: true
+    signal_score_min: 60
+  factor_weights:
+    momentum: 0.45
+    liquidity: 0.30
+    stability: 0.25
+  scoring_profile:
+    stability_invalid_pe_penalty: 0
+  risk_profile:
+    invalid_pe_points: 0
+    high_pb_points: 0
+  portfolio_profile:
+    concentration_penalty: 0
+  scorecard_profile:
+    value_quality_bonus: 0
+    capital_confirmed_bonus: 0
+    catalyst_bonus: 0
+    catalyst_bonus_cap: 0
+  ranking_hints: |
+    只依据主题、成交额、买卖价差、基金规模、趋势、波动、回撤和数据质量排序。
+    费率、跟踪误差和折溢价在缺少字段时保持未知。
+  max_output: 5

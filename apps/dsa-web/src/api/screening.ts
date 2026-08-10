@@ -20,6 +20,7 @@ export type ScreeningStatus = {
   referenceRevision?: string | null;
   sourceHealth?: Record<string, Record<string, Record<string, unknown>>>;
   diagnostics?: Record<string, string>;
+  supportedMarkets?: string[];
 };
 
 export type ScreeningCandidate = {
@@ -46,6 +47,14 @@ export type ScreeningCandidate = {
   changePct?: number | null;
   amount?: number | null;
   industry?: string;
+  assetType?: 'stock' | 'etf' | string;
+  fundType?: string;
+  fundSize?: number | null;
+  themeKey?: string;
+  themeName?: string;
+  bidAskSpreadBps?: number | null;
+  universeMode?: string;
+  dailyAdjustment?: string;
   factorScores?: Record<string, number>;
   postAnalysisSummaries?: Record<string, string>;
   postAnalysisTags?: string[];
@@ -223,6 +232,10 @@ export type ScreeningScreenResponse = {
   rankingMode?: 'llm' | 'factor' | string;
   warnings?: string[];
   sourceErrors?: string[];
+  universeSource?: string;
+  universeMode?: string;
+  unclassifiedCount?: number;
+  exclusionCounts?: Record<string, number>;
   dsaEnrichment?: {
     enabled?: boolean;
     maxCandidates?: number;

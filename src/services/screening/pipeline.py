@@ -26,6 +26,7 @@ from src.services.screening.filter import (
 )
 from src.services.screening.industry import enrich_industry_concepts
 from src.services.screening.models import Pick, ScreenResult
+from src.services.screening.market_profile import get_market_profile
 from src.services.screening.normalize import (
     normalize_code,
     safe_bool as _safe_bool,
@@ -108,8 +109,7 @@ def screen(
     if config is None:
         config = Config.from_env()
 
-    if market not in ("cn", "us"):
-        raise ValueError(f"Unsupported market: {market!r} (supported: cn, us)")
+    profile = get_market_profile(market)
 
     run_id = uuid.uuid4().hex[:12]
     degradation: list[str] = []
@@ -133,6 +133,13 @@ def screen(
     )
     if deep_analysis and "dsa" not in analyzer_names:
         analyzer_names.append("dsa")
+    if not profile.allow_dsa:
+        skipped = [name for name in analyzer_names if name in {"dsa", "external_http"}]
+        analyzer_names = [name for name in analyzer_names if name not in {"dsa", "external_http"}]
+        if skipped:
+            degradation.append(
+                f"Post analyzers skipped for {market}: {','.join(skipped)}"
+            )
     analyzer_max_picks = (
         post_analysis_max_picks
         or deep_analysis_max_picks
@@ -140,6 +147,8 @@ def screen(
     daily_needed = requires_daily_features(screening.hard_filters)
     daily_requested = config.daily_enrich_enabled if daily_enrich is None else daily_enrich
     daily_limit = daily_enrich_max_candidates or config.daily_enrich_max_candidates
+    if profile.daily_candidate_limit is not None:
+        daily_limit = min(daily_limit, profile.daily_candidate_limit)
     snapshot_filters = without_daily_filters(screening.hard_filters) if daily_needed else screening.hard_filters
 
     # 2. Fetch snapshot
@@ -163,7 +172,10 @@ def screen(
         else config.industry_provider
     )
     effective_industry_provider = str(effective_industry_provider or "none").strip().lower()
-    if effective_industry_map_files or effective_industry_provider not in {"", "none", "off", "false"}:
+    if profile.enrich_industry and (
+        effective_industry_map_files
+        or effective_industry_provider not in {"", "none", "off", "false"}
+    ):
         snapshot_df, industry_notes = enrich_industry_concepts(
             snapshot_df,
             map_files=effective_industry_map_files,
@@ -176,6 +188,13 @@ def screen(
     snapshot_count = len(snapshot_df)
     snapshot_source = str(snapshot_df.attrs.get("snapshot_source", ""))
     source_errors = [str(item) for item in snapshot_df.attrs.get("source_errors", [])]
+    universe_source = str(snapshot_df.attrs.get("universe_source", ""))
+    universe_mode = str(snapshot_df.attrs.get("universe_mode", ""))
+    unclassified_count = int(snapshot_df.attrs.get("unclassified_count", 0) or 0)
+    exclusion_counts = {
+        str(key): int(value)
+        for key, value in dict(snapshot_df.attrs.get("exclusion_counts", {}) or {}).items()
+    }
     degradation.extend(f"Snapshot source fallback: {item}" for item in source_errors)
     if bool(snapshot_df.attrs.get("fallback_used")):
         stale_age = snapshot_df.attrs.get("stale_age_hours")
@@ -219,12 +238,20 @@ def screen(
             daily_enriched=False,
             risk_enabled=config.risk_enabled,
             portfolio_diversity_enabled=config.portfolio_diversity_enabled,
+            universe_source=universe_source,
+            universe_mode=universe_mode,
+            unclassified_count=unclassified_count,
+            exclusion_counts=exclusion_counts,
         )
 
     daily_enriched = False
     daily_enrich_count = 0
     if daily_needed or daily_requested:
         provisional = _sort_screened_candidates(compute_screen_scores(df, screening), screening)
+        if profile.theme_preselect_limit is not None:
+            provisional = _preselect_by_theme(
+                provisional, profile.theme_preselect_limit
+            )
         enrich_count = min(daily_limit, len(provisional))
         daily_candidates = provisional.head(enrich_count)
         try:
@@ -238,6 +265,7 @@ def screen(
                 cache_ttl_seconds=config.daily_history_cache_ttl_hours * 3600,
                 max_workers=config.daily_fetch_max_workers,
                 history_fetcher=daily_history_fetcher,
+                market=profile.daily_market,
             )
             daily_enriched = True
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]
@@ -317,6 +345,10 @@ def screen(
             daily_enrich_count=daily_enrich_count,
             risk_enabled=config.risk_enabled,
             portfolio_diversity_enabled=config.portfolio_diversity_enabled,
+            universe_source=universe_source,
+            universe_mode=universe_mode,
+            unclassified_count=unclassified_count,
+            exclusion_counts=exclusion_counts,
         )
 
     # 4. Compute screen_score
@@ -328,7 +360,15 @@ def screen(
         config.llm_max_candidates,
         len(df),
     )
-    df_top = df.head(top_k)
+    df_top = (
+        _select_theme_coverage_candidates(
+            df,
+            limit=top_k,
+            required_themes=output_count,
+        )
+        if profile.hard_theme_dedup
+        else df.head(top_k)
+    )
 
     # 6. Build Pick list
     picks = _df_to_picks(df_top)
@@ -336,7 +376,8 @@ def screen(
     # 6.5. Host-provided candidate context, e.g. DSA realtime quote,
     # fundamentals, and news. This runs before LLM ranking so L2 can use it.
     _emit_progress(progress_callback, 52, "正在补充候选行情与基本面")
-    degradation.extend(apply_dsa_provider_context(picks, context))
+    if profile.collect_company_context:
+        degradation.extend(apply_dsa_provider_context(picks, context))
     llm_fallback_picks = [copy.deepcopy(pick) for pick in picks]
 
     # 7. L2 LLM ranking
@@ -358,7 +399,7 @@ def screen(
             if collect_llm_candidate_context is None
             else collect_llm_candidate_context
         )
-        if should_collect_candidate_context:
+        if should_collect_candidate_context and profile.allow_candidate_context:
             candidate_context_rows, candidate_context_errors = collect_candidate_context(
                 df_top,
                 max_rows=(
@@ -462,7 +503,7 @@ def screen(
     # 9. LLM-driven portfolio overlay. This runs before trimming so an
     # over-crowded sector can make room for a comparable candidate elsewhere.
     portfolio_concentration_notes: list[str] = []
-    if config.portfolio_diversity_enabled:
+    if config.portfolio_diversity_enabled and profile.allow_portfolio_overlay:
         picks, portfolio_concentration_notes = apply_portfolio_overlay(
             picks,
             max_same_sector=config.portfolio_max_same_llm_sector,
@@ -510,6 +551,13 @@ def screen(
 
     # Apply selection variant after post-analyzers to ensure rotation respects
     # final_score adjustments made by L3 analyzers (e.g. scorecard/dsa).
+    if profile.hard_theme_dedup:
+        before_dedup = len(picks)
+        picks = _deduplicate_etf_themes(picks)
+        degradation.append(
+            f"ETF theme dedup kept {len(picks)} of {before_dedup} candidates"
+        )
+
     selection_variant = apply_seeded_selection_variant(
         picks,
         max_output=output_count,
@@ -521,6 +569,10 @@ def screen(
         analyzer_names=analyzer_names,
     )
     picks = selection_variant.picks
+    if profile.hard_theme_dedup and len(picks) < output_count:
+        degradation.append(
+            f"insufficient_distinct_themes: requested={output_count}, returned={len(picks)}"
+        )
     _emit_progress(progress_callback, 88, "选股核心流程完成")
 
     return ScreenResult(
@@ -545,12 +597,18 @@ def screen(
         degradation=degradation,
         snapshot_source=snapshot_source,
         source_errors=source_errors,
+        universe_source=universe_source,
+        universe_mode=universe_mode,
+        unclassified_count=unclassified_count,
+        exclusion_counts=exclusion_counts,
         deep_analysis_requested=("dsa" in analyzer_names),
         post_analyzers=analyzer_names,
         daily_enriched=daily_enriched,
         daily_enrich_count=daily_enrich_count,
         risk_enabled=config.risk_enabled,
-        portfolio_diversity_enabled=config.portfolio_diversity_enabled,
+        portfolio_diversity_enabled=(
+            config.portfolio_diversity_enabled and profile.allow_portfolio_overlay
+        ),
         portfolio_concentration_notes=portfolio_concentration_notes,
         result_variant_applied=selection_variant.applied,
         result_variant_pool_size=selection_variant.pool_size,
@@ -597,6 +655,13 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             pb_ratio=_safe_float(row.get("pb_ratio", row.get("市净率"))),
             industry=_safe_text(row.get("industry", row.get("行业", row.get("所属行业", "")))),
             concepts=_safe_text(row.get("concepts", row.get("概念", row.get("概念题材", "")))),
+            asset_type=_safe_text(row.get("asset_type")) or "stock",
+            fund_type=_safe_text(row.get("fund_type")),
+            fund_size=_safe_float(row.get("fund_size")),
+            theme_key=_safe_text(row.get("theme_key")),
+            theme_name=_safe_text(row.get("theme_name")),
+            bid_ask_spread_bps=_safe_float(row.get("bid_ask_spread_bps")),
+            universe_mode=_safe_text(row.get("universe_mode")),
             industry_rank=_safe_int(row.get("industry_rank")),
             industry_change_pct=_safe_float(row.get("industry_change_pct")),
             industry_heat_score=_safe_float(row.get("industry_heat_score")),
@@ -627,6 +692,7 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             daily_quality_score=_safe_float(row.get("daily_quality_score")),
             daily_quality_flags=_safe_text(row.get("daily_quality_flags")),
             daily_source=_safe_text(row.get("daily_source")),
+            daily_adjustment=_safe_text(row.get("daily_adjustment")),
             factor_scores=factor_scores,
         ))
     return picks
@@ -655,6 +721,97 @@ def _sort_screened_candidates(df: pd.DataFrame, screening=None) -> pd.DataFrame:
     if not sort_columns:
         return df
     return df.sort_values(sort_columns, ascending=ascending, kind="mergesort")
+
+
+def _preselect_by_theme(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    """Keep a bounded top slice per ETF exposure before daily requests."""
+    if "theme_key" not in df.columns or limit <= 0:
+        return df
+    sort_columns = [
+        column for column in ("screen_score", "amount", "fund_size")
+        if column in df.columns
+    ]
+    if "code" in df.columns:
+        sort_columns.append("code")
+    ordered = df
+    if sort_columns:
+        ordered = df.sort_values(
+            sort_columns,
+            ascending=[column == "code" for column in sort_columns],
+            kind="mergesort",
+        )
+    return (
+        ordered.groupby("theme_key", sort=False, dropna=False)
+        .head(int(limit))
+        .copy()
+    )
+
+
+def _select_theme_coverage_candidates(
+    df: pd.DataFrame,
+    *,
+    limit: int,
+    required_themes: int,
+) -> pd.DataFrame:
+    """Reserve enough distinct ETF exposures before the LLM shortlist is cut."""
+    if (
+        df.empty
+        or "theme_key" not in df.columns
+        or limit <= 0
+        or required_themes <= 0
+    ):
+        return df.head(max(int(limit), 0)).copy()
+
+    ordered = df.copy()
+    selected_indexes: list[object] = []
+    selected_set: set[object] = set()
+    seen_themes: set[str] = set()
+
+    for index, row in ordered.iterrows():
+        theme_key = str(row.get("theme_key") or f"fund_{row.get('code', index)}")
+        if theme_key in seen_themes:
+            continue
+        selected_indexes.append(index)
+        selected_set.add(index)
+        seen_themes.add(theme_key)
+        if len(seen_themes) >= min(int(required_themes), int(limit)):
+            break
+
+    for index in ordered.index:
+        if len(selected_indexes) >= int(limit):
+            break
+        if index in selected_set:
+            continue
+        selected_indexes.append(index)
+        selected_set.add(index)
+
+    order = {index: position for position, index in enumerate(ordered.index)}
+    selected_indexes.sort(key=order.__getitem__)
+    return ordered.loc[selected_indexes].copy()
+
+
+def _deduplicate_etf_themes(picks: list[Pick]) -> list[Pick]:
+    """Keep one final ETF per exposure with deterministic tie breakers."""
+    ordered = sorted(
+        picks,
+        key=lambda pick: (
+            -float(pick.final_score),
+            -float(pick.amount or 0),
+            -float(pick.fund_size or 0),
+            pick.code,
+        ),
+    )
+    seen: set[str] = set()
+    result: list[Pick] = []
+    for pick in ordered:
+        key = pick.theme_key or f"fund_{pick.code}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(pick)
+    for index, pick in enumerate(result, start=1):
+        pick.rank = index
+    return result
 
 
 def _required_snapshot_columns(filters) -> list[str]:

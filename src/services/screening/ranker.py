@@ -26,6 +26,7 @@ def _normalize_code(value: object) -> str:
     # US tickers may pass through (see normalize_code docstring).
     return normalize_code(value, allow_ticker=True)
 
+
 logger = logging.getLogger(__name__)
 _DEFAULT_RANKING_PROMPT_MAX_CHARS = 24_000
 _PROMPT_TRIM_MARKER = "[prompt_trimmed]"
@@ -244,7 +245,8 @@ def _build_ranking_prompt(
     hints_text = hints.strip() or "无额外排序提示。"
     context_text = context.strip() or "无额外上下文。只能基于候选池结构化数据和策略偏好判断。"
     candidates_text = "\n".join(_format_candidate_for_prompt(p) for p in candidates)
-    prompt = _render_ranking_prompt(hints_text, context_text, candidates_text)
+    is_etf = bool(candidates) and all(p.asset_type == "etf" for p in candidates)
+    prompt = _render_ranking_prompt(hints_text, context_text, candidates_text, is_etf=is_etf)
     if max_chars is None or len(prompt) <= max_chars:
         return prompt
     return _build_bounded_ranking_prompt(
@@ -253,10 +255,29 @@ def _build_ranking_prompt(
         context_text,
         max_chars=max_chars,
         degradation=degradation,
+        is_etf=is_etf,
     )
 
 
-def _render_ranking_prompt(hints: str, context: str, candidates_text: str) -> str:
+def _render_ranking_prompt(
+    hints: str, context: str, candidates_text: str, *, is_etf: bool = False
+) -> str:
+    if is_etf:
+        return f"""你是一个专业的 ETF 研究员，任务是在已经由代码硬筛过的 A 股股票指数 ETF 候选池内做相对排序。
+只能使用候选中实际提供的主题、成交额、买卖价差、基金规模、趋势、波动、回撤和数据质量；未知字段保持未知。不得推断费率、跟踪误差、折溢价或公司基本面，不得引入候选池外标的。
+
+## 排序依据
+{hints}
+
+## 市场上下文
+{context}
+
+## 候选列表
+{candidates_text}
+
+## 输出要求
+只返回与股票排序契约相同结构的 JSON。ranked 每项包含 code、llm_score、confidence、sector、theme、thesis、reason、risk、catalysts、risk_flags、tags、style_fit、watch_items、invalidators。
+"""
     return f"""你是一个专业的股票研究员，任务是在“已经由代码硬筛过”的候选池内做相对排序。
 你不能推荐候选池外股票，不能修改硬筛条件，不能给目标价或承诺收益。你的价值在于：
 1. 结合策略偏好，对候选之间做跨股票比较；
@@ -309,13 +330,14 @@ def _build_bounded_ranking_prompt(
     *,
     max_chars: int,
     degradation: list[str] | None,
+    is_etf: bool = False,
 ) -> str:
     trimmed: list[str] = []
     identity_text = "\n".join(_format_candidate_for_prompt(p, detail="identity") for p in candidates)
     base_min = _render_ranking_prompt(
         _truncate_prompt_text(hints, 900, "hints", trimmed),
         "",
-        identity_text,
+        identity_text, is_etf=is_etf,
     )
     context_budget = max(int(max_chars) - len(base_min) - 80, 0)
     context_text = _truncate_prompt_text(context, context_budget, "context", trimmed)
@@ -323,14 +345,14 @@ def _build_bounded_ranking_prompt(
     prompt_without_candidates = _render_ranking_prompt(
         _truncate_prompt_text(hints, 900, "hints", trimmed),
         context_text,
-        "",
+        "", is_etf=is_etf,
     )
     candidate_budget = max(int(max_chars) - len(prompt_without_candidates), 0)
     candidates_text = _fit_candidate_prompt_lines(candidates, candidate_budget, trimmed)
     prompt = _render_ranking_prompt(
         _truncate_prompt_text(hints, 900, "hints", trimmed),
         context_text,
-        candidates_text,
+        candidates_text, is_etf=is_etf,
     )
 
     if len(prompt) > max_chars:
@@ -344,14 +366,14 @@ def _build_bounded_ranking_prompt(
         prompt_without_candidates = _render_ranking_prompt(
             _truncate_prompt_text(hints, 600, "hints", trimmed),
             context_text,
-            "",
+            "", is_etf=is_etf,
         )
         candidate_budget = max(int(max_chars) - len(prompt_without_candidates), 0)
         candidates_text = _fit_candidate_prompt_lines(candidates, candidate_budget, trimmed)
         prompt = _render_ranking_prompt(
             _truncate_prompt_text(hints, 600, "hints", trimmed),
             context_text,
-            candidates_text,
+            candidates_text, is_etf=is_etf,
         )
 
     if len(prompt) > max_chars:
@@ -378,6 +400,18 @@ def _format_candidate_for_prompt(p: Pick, *, detail: str = "full") -> str:
             f"screen_score={p.screen_score:.1f}, industry={p.industry or 'unknown'}, "
             f"concepts={p.concepts or 'unknown'}, board_heat_score={p.board_heat_score}, "
             f"signal_score={p.signal_score}, dsa_context={_format_dsa_context_for_prompt(p)}"
+        )
+    if p.asset_type == "etf":
+        return (
+            f"- {p.code} {p.name}: asset_type=etf, theme={p.theme_name or 'unknown'}, "
+            f"fund_type={p.fund_type or 'unknown'}, price={p.price}, change_pct={p.change_pct}%, "
+            f"amount={p.amount:.0f}, bid_ask_spread_bps={p.bid_ask_spread_bps}, "
+            f"fund_size={p.fund_size}, change_60d={p.change_60d}, signal_score={p.signal_score}, "
+            f"ma_bullish={p.ma_bullish}, price_above_ma20={p.price_above_ma20}, "
+            f"macd={p.macd_status}, rsi={p.rsi_status}, volatility_20d_pct={p.volatility_20d_pct}, "
+            f"max_drawdown_20d_pct={p.max_drawdown_20d_pct}, atr_20_pct={p.atr_20_pct}, "
+            f"daily_quality_score={p.daily_quality_score}, daily_quality_flags={p.daily_quality_flags or 'none'}, "
+            f"screen_score={p.screen_score:.1f}, factor_scores={p.factor_scores}"
         )
     return (
         f"- {p.code} {p.name}: price={p.price}, change_pct={p.change_pct}%, "
