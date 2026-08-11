@@ -13,6 +13,7 @@ import os
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
@@ -454,39 +455,81 @@ def _fetch_sina() -> pd.DataFrame:
     sources.
     """
     url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    page = 1
     # Sina caps this endpoint at 100 rows. Use the cap to reduce full-market
     # pagination round trips without changing the response contract.
     page_size = 100
-    all_items = []
-    while True:
-        resp = requests.get(
-            url,
-            params={
-                "page": page,
-                "num": page_size,
-                "sort": "symbol",
-                "asc": 1,
-                "node": "hs_a",
-                "symbol": "",
-                "_s_r_a": "page",
-            },
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://vip.stock.finance.sina.com.cn/mkt/",
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        items = resp.json()
-        if not isinstance(items, list):
-            raise RuntimeError("sina snapshot returned malformed data")
-        if not items:
-            break
-        all_items.extend(items)
-        if len(items) < page_size:
-            break
-        page += 1
+    # The full A-share market is ~5500 securities, so 60 pages of 100 rows
+    # cover it. Fetch a bounded batch at a time: this retains some concurrency
+    # without letting an irrelevant tail-page failure invalidate a snapshot
+    # whose terminal page was already reached.
+    max_pages = 60
+    batch_size = 4
+    _headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://vip.stock.finance.sina.com.cn/mkt/",
+    }
+
+    def fetch_page(page: int) -> tuple[int, list[dict]]:
+        # Sina occasionally rate-limits bursty pagination (HTTP 456). Retry once
+        # with a short pause before giving up so a transient throttle does not
+        # discard the whole snapshot source.
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = requests.get(
+                    url,
+                    params={
+                        "page": page,
+                        "num": page_size,
+                        "sort": "symbol",
+                        "asc": 1,
+                        "node": "hs_a",
+                        "symbol": "",
+                        "_s_r_a": "page",
+                    },
+                    headers=_headers,
+                    timeout=15,
+                )
+                if resp.status_code == 456 and attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                resp.raise_for_status()
+                items = resp.json()
+                if not isinstance(items, list):
+                    raise RuntimeError("sina snapshot returned malformed data")
+                return page, items
+            except Exception as exc:  # noqa: BLE001 - retry transient failures once.
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(0.3)
+                    continue
+        raise RuntimeError(f"sina snapshot page {page} failed: {last_error}")
+
+    all_items: list[dict] = []
+    terminal_reached = False
+    with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        for batch_start in range(1, max_pages + 1, batch_size):
+            pages = range(batch_start, min(batch_start + batch_size, max_pages + 1))
+            futures = {page: executor.submit(fetch_page, page) for page in pages}
+            for page in pages:
+                try:
+                    _, items = futures[page].result()
+                except Exception:
+                    # Fail only when this page is required to establish the
+                    # contiguous snapshot. Later pages in a batch are ignored
+                    # once an earlier terminal page has been observed.
+                    if terminal_reached:
+                        continue
+                    raise
+                if not items:
+                    terminal_reached = True
+                    break
+                all_items.extend(items)
+                if len(items) < page_size:
+                    terminal_reached = True
+                    break
+            if terminal_reached:
+                break
     if not all_items:
         raise RuntimeError("sina returned empty data")
     df = pd.DataFrame(all_items)
@@ -503,12 +546,14 @@ def _fetch_em_datacenter() -> pd.DataFrame:
     This works even on weekends (returns last trading day data).
     """
     url = "https://data.eastmoney.com/dataapi/xuangu/list"
-    all_items = []
-    page = 1
     page_size = 500
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://data.eastmoney.com/xuangu/",
+    }
 
-    while True:
-        params = {
+    def _build_params(page: int) -> dict:
+        return {
             "st": "SECURITY_CODE",
             "sr": "1",
             "ps": str(page_size),
@@ -520,25 +565,27 @@ def _fetch_em_datacenter() -> pd.DataFrame:
             "source": "SELECT_SECURITIES",
             "client": "WEB",
         }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://data.eastmoney.com/xuangu/",
-        }
 
-        resp = _eastmoney_get(url, params=params, headers=headers, timeout=30)
+    all_items: list = []
+    page = 1
+    while True:
+        resp = _eastmoney_get(
+            url,
+            params=_build_params(page),
+            headers=_headers,
+            timeout=30,
+        )
         data = resp.json()
-
         if not data.get("success"):
             raise RuntimeError(f"em_datacenter API error: {data.get('message', 'unknown')}")
 
-        items = data["result"]["data"]
+        result = data.get("result") or {}
+        items = result.get("data") or []
         all_items.extend(items)
-
-        total_count = data["result"]["count"]
+        total_count = int(result.get("count") or 0)
         if page * page_size >= total_count:
             break
         page += 1
-
     if not all_items:
         raise RuntimeError("em_datacenter returned no data")
 

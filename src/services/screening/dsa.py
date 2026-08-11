@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 import requests
@@ -60,11 +61,7 @@ def analyze_picks_with_dsa(
     degradation: list[str] = []
     endpoint = build_dsa_analyze_url(api_url)
 
-    for idx, pick in enumerate(picks):
-        if idx >= analyze_count:
-            # The post-analysis orchestrator owns the explicit skipped status.
-            continue
-
+    def _analyze_one(idx: int, pick: Pick) -> tuple[int, Pick, bool, dict, str]:
         try:
             result = call_dsa_analysis(
                 endpoint,
@@ -76,16 +73,37 @@ def analyze_picks_with_dsa(
                 force_refresh=force_refresh,
                 notify=notify,
             )
+            return idx, pick, True, result, ""
+        except Exception as exc:  # noqa: BLE001 - external DSA analysis is best-effort.
+            return idx, pick, False, {}, str(exc)
+
+    targeted = picks[:analyze_count]
+    # Candidates are analyzed concurrently so deep-analysis latency does not
+    # scale linearly with the candidate count. Each candidate mutates its own
+    # Pick object, so the parallel writes are isolated per candidate.
+    outcomes: dict[int, tuple[Pick, bool, dict, str]] = {}
+    with ThreadPoolExecutor(max_workers=min(3, analyze_count)) as executor:
+        futures = [
+            executor.submit(_analyze_one, idx, pick)
+            for idx, pick in enumerate(targeted)
+        ]
+        for future in as_completed(futures):
+            idx, pick, ok, result, error = future.result()
+            outcomes[idx] = (pick, ok, result, error)
+
+    for idx in sorted(outcomes):
+        pick, ok, result, error = outcomes[idx]
+        if ok:
             pick.deep_analysis_status = "completed"
             pick.deep_analysis_query_id = str(result.get("query_id", ""))
             pick.deep_analysis_result = result
             pick.deep_analysis_summary = extract_deep_analysis_summary(result)
             _attach_deep_analysis_fields(pick, result)
-        except Exception as exc:
-            logger.warning("DSA deep analysis failed for %s: %s", pick.code, exc)
+        else:
+            logger.warning("DSA deep analysis failed for %s: %s", pick.code, error)
             pick.deep_analysis_status = "failed"
-            pick.deep_analysis_error = str(exc)
-            degradation.append(f"DSA deep analysis failed for {pick.code}: {exc}")
+            pick.deep_analysis_error = error
+            degradation.append(f"DSA deep analysis failed for {pick.code}: {error}")
 
     return picks, degradation
 

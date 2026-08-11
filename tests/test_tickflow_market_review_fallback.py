@@ -91,6 +91,19 @@ class TestTickFlowMarketReviewFallback(unittest.TestCase):
         self.assertEqual(data, [{"code": "fallback"}])
         self.assertEqual(fallback.index_calls, 1)
 
+    def test_manager_prefers_akshare_over_configured_cn_fallbacks(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        first = _DummyFetcher("EfinanceFetcher", indices=[{"code": "ef"}])
+        akshare = _DummyFetcher("AkshareFetcher", indices=[{"code": "ak"}])
+        manager._fetchers = [first, akshare]
+        manager._get_tickflow_fetcher = lambda: None
+
+        data = DataFetcherManager.get_main_indices(manager, region="cn")
+
+        self.assertEqual(data, [{"code": "ak"}])
+        self.assertEqual(first.index_calls, 0)
+        self.assertEqual(akshare.index_calls, 1)
+
     def test_manager_skips_tickflow_for_non_cn_indices(self):
         manager = DataFetcherManager.__new__(DataFetcherManager)
         fallback = _DummyFetcher("YfinanceFetcher", indices=[{"code": "^GSPC"}])
@@ -103,6 +116,21 @@ class TestTickFlowMarketReviewFallback(unittest.TestCase):
 
         self.assertEqual(data, [{"code": "^GSPC"}])
         self.assertEqual(fallback.index_calls, 1)
+
+    def test_manager_keeps_configured_order_for_non_cn_indices(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        yfinance = _DummyFetcher("YfinanceFetcher", indices=[{"code": "^GSPC"}])
+        akshare = _DummyFetcher("AkshareFetcher", indices=[{"code": "ak-us"}])
+        manager._fetchers = [yfinance, akshare]
+        manager._get_tickflow_fetcher = lambda: self.fail(
+            "TickFlow should not be called for non-CN indices"
+        )
+
+        data = DataFetcherManager.get_main_indices(manager, region="us")
+
+        self.assertEqual(data, [{"code": "^GSPC"}])
+        self.assertEqual(yfinance.index_calls, 1)
+        self.assertEqual(akshare.index_calls, 0)
 
     def test_manager_falls_back_when_tickflow_market_stats_fails(self):
         manager = DataFetcherManager.__new__(DataFetcherManager)

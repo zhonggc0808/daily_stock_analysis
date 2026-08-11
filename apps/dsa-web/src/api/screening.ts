@@ -313,6 +313,70 @@ export type ScreeningSourceHistory = {
   }>;
 };
 
+export const SCREENING_RESULT_STORAGE_KEY = 'dsa.screening.lastResult.v1';
+
+export type PersistedScreeningResult = {
+  savedAt: number;
+  result: ScreeningScreenResponse;
+};
+
+/**
+ * Persist the most recent completed screening result in localStorage so it
+ * survives page navigation within the same day. Results are intentionally
+ * short-lived (screening output is only meaningful for the day it was
+ * generated), so callers should clear it once it is superseded or expired.
+ */
+export function persistScreeningResult(result: ScreeningScreenResponse): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    const payload: PersistedScreeningResult = {
+      savedAt: Date.now(),
+      result,
+    };
+    window.localStorage.setItem(SCREENING_RESULT_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Best-effort persistence only; navigation recovery is best-effort.
+  }
+}
+
+export function readPersistedScreeningResult(): PersistedScreeningResult | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(SCREENING_RESULT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<PersistedScreeningResult>;
+    if (
+      typeof parsed.savedAt !== 'number'
+      || !parsed.result
+      || !Array.isArray(parsed.result.candidates)
+    ) {
+      clearPersistedScreeningResult();
+      return null;
+    }
+    return { savedAt: parsed.savedAt, result: parsed.result };
+  } catch {
+    clearPersistedScreeningResult();
+    return null;
+  }
+}
+
+export function clearPersistedScreeningResult(): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(SCREENING_RESULT_STORAGE_KEY);
+  } catch {
+    // Ignore storage cleanup failures.
+  }
+}
+
 export function notifyScreeningConfigChanged(): void {
   window.dispatchEvent(new Event(SCREENING_CONFIG_CHANGED_EVENT));
   notifySystemConfigChanged();

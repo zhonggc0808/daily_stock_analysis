@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApiError, createParsedApiError } from '../../api/error';
+import { SCREENING_RESULT_STORAGE_KEY } from '../../api/screening';
 import { AuthProvider, useAuth } from '../AuthContext';
 
 const { getStatus, login, changePassword, logout, resetDashboardState } = vi.hoisted(() => ({
@@ -48,6 +49,7 @@ const Probe = () => {
 describe('AuthContext', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
   });
 
   it('refreshes auth state after a successful login', async () => {
@@ -80,6 +82,7 @@ describe('AuthContext', () => {
   });
 
   it('refreshes auth state after logout', async () => {
+    window.localStorage.setItem(SCREENING_RESULT_STORAGE_KEY, '{"savedAt":1,"result":{"candidates":[]}}');
     getStatus
       .mockResolvedValueOnce({
         authEnabled: true,
@@ -107,6 +110,40 @@ describe('AuthContext', () => {
 
     await waitFor(() => expect(screen.getByTestId('status')).toHaveTextContent('logged-out'));
     expect(resetDashboardState).toHaveBeenCalled();
+    expect(window.localStorage.getItem(SCREENING_RESULT_STORAGE_KEY)).toBeNull();
+  });
+
+  it('clears persisted screening results when authentication requires login', async () => {
+    window.localStorage.setItem(SCREENING_RESULT_STORAGE_KEY, '{"savedAt":1,"result":{"candidates":[]}}');
+    getStatus.mockResolvedValueOnce({
+      authEnabled: true,
+      loggedIn: false,
+      passwordSet: true,
+      passwordChangeable: true,
+      setupState: 'enabled',
+    });
+
+    render(
+      <AuthProvider>
+        <Probe />
+      </AuthProvider>
+    );
+
+    await screen.findByTestId('status');
+    expect(window.localStorage.getItem(SCREENING_RESULT_STORAGE_KEY)).toBeNull();
+  });
+
+  it('clears persisted screening results when auth status loading fails', async () => {
+    window.localStorage.setItem(SCREENING_RESULT_STORAGE_KEY, '{"savedAt":1,"result":{"candidates":[]}}');
+    getStatus.mockRejectedValueOnce(new Error('status unavailable'));
+
+    render(
+      <AuthProvider>
+        <Probe />
+      </AuthProvider>
+    );
+
+    await waitFor(() => expect(window.localStorage.getItem(SCREENING_RESULT_STORAGE_KEY)).toBeNull());
   });
 
   it('does not reset dashboard state when auth is disabled', async () => {

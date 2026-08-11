@@ -14,8 +14,14 @@ from src.services.screening.pipeline import (
 from src.services.screening.pipeline import screen
 from src.services.screening.config import Config
 from src.services.screening.ranker import _build_ranking_prompt
-from src.services.screening.snapshot_etf import classify_theme, qualify_etf_snapshot
-from src.services.screening.snapshot_etf import _namespaced_path
+from src.services.screening.snapshot_etf import (
+    _fetch_tencent_etf_snapshot,
+    _namespaced_path,
+    _write_json_cache,
+    classify_theme,
+    fetch_etf_snapshot_with_fallback,
+    qualify_etf_snapshot,
+)
 
 
 def _snapshot(*rows: tuple[str, str]) -> pd.DataFrame:
@@ -178,6 +184,186 @@ def test_etf_snapshot_cache_path_isolated_from_cn(tmp_path: Path):
     etf_cache = _namespaced_path(stock_cache, "cn_etf")
     assert etf_cache == tmp_path / "snapshot.last_good_cn_etf.json"
     assert etf_cache != stock_cache
+
+
+def _tencent_quote_line(symbol: str, code: str) -> str:
+    fields = [""] * 88
+    fields[1] = f"ETF-{code}"
+    fields[2] = code
+    fields[3] = "1.234"
+    fields[6] = "123"
+    fields[9] = "1.233"
+    fields[19] = "1.234"
+    fields[32] = "1.25"
+    fields[35] = "1.234/123/15178.2"
+    fields[37] = "2"
+    return f'v_s_{symbol}="{"~".join(fields)}";'
+
+
+def test_tencent_etf_snapshot_batches_and_normalizes_quote_fields():
+    exchange = {
+        f"5{index:05d}": {"fund_type": "指数型-股票"}
+        for index in range(151)
+    }
+    session = MagicMock()
+
+    def respond(url: str, **_kwargs):
+        symbols = url.split("q=", 1)[1].split(",")
+        response = MagicMock()
+        response.content = "".join(
+            _tencent_quote_line(symbol, symbol[2:]) for symbol in symbols
+        ).encode("gbk")
+        return response
+
+    session.get.side_effect = respond
+    with patch(
+        "src.services.screening.snapshot_etf.requests.Session",
+        return_value=session,
+    ):
+        result = _fetch_tencent_etf_snapshot(exchange)
+
+    assert len(result) == 151
+    assert session.get.call_count == 2
+    assert result.iloc[0]["price"] == pytest.approx(1.234)
+    assert result.iloc[0]["amount"] == pytest.approx(15178.2)
+    assert result.iloc[0]["volume"] == pytest.approx(12300)
+    assert result.iloc[0]["bid"] == pytest.approx(1.233)
+    assert result.iloc[0]["ask"] == pytest.approx(1.234)
+    assert result.attrs["batch_count"] == 2
+    assert result.attrs["returned_code_count"] == 151
+    session.close.assert_called_once()
+
+
+def test_tencent_etf_snapshot_rejects_truncated_market_response():
+    exchange = {
+        "510300": {"fund_type": "指数型-股票"},
+        "512480": {"fund_type": "指数型-股票"},
+    }
+    response = MagicMock()
+    response.content = _tencent_quote_line("sh510300", "510300").encode("gbk")
+    session = MagicMock()
+    session.get.return_value = response
+    with (
+        patch(
+            "src.services.screening.snapshot_etf.requests.Session",
+            return_value=session,
+        ),
+        pytest.raises(RuntimeError, match="coverage too low"),
+    ):
+        _fetch_tencent_etf_snapshot(exchange)
+
+
+def test_tencent_etf_snapshot_rejects_response_after_total_deadline():
+    exchange = {"510300": {"fund_type": "指数型-股票"}}
+    response = MagicMock()
+    response.content = _tencent_quote_line("sh510300", "510300").encode("gbk")
+    session = MagicMock()
+    session.get.return_value = response
+    with (
+        patch(
+            "src.services.screening.snapshot_etf.requests.Session",
+            return_value=session,
+        ),
+        patch(
+            "src.services.screening.snapshot_etf.time.monotonic",
+            side_effect=[100.0, 100.0, 116.0],
+        ),
+        pytest.raises(TimeoutError, match="exceeded 15s total timeout"),
+    ):
+        _fetch_tencent_etf_snapshot(exchange)
+
+    session.close.assert_called_once()
+
+
+def test_etf_snapshot_prefers_tencent_when_exchange_codes_are_cached(tmp_path: Path):
+    exchange = {
+        "510300": {"fund_type": "指数型-股票", "fund_shares": 1_000_000}
+    }
+    _write_json_cache(tmp_path / "cn_etf_exchange_universe.json", exchange)
+    with (
+        patch(
+            "src.services.screening.snapshot_etf._load_exchange_universe",
+            return_value=(exchange, "exchange_cache", ["live list offline"]),
+        ),
+        patch(
+            "src.services.screening.snapshot_etf._load_fund_types",
+            return_value=({"510300": "指数型-股票"}, "fund_type_cache", []),
+        ),
+        patch(
+            "src.services.screening.snapshot_etf._fetch_tencent_etf_snapshot",
+            return_value=_snapshot(("510300", "沪深300ETF")),
+        ) as tencent,
+        patch("src.services.screening.snapshot_etf._fetch_sina_etf_snapshot") as sina,
+    ):
+        result = fetch_etf_snapshot_with_fallback(
+            fallback_snapshot_path=tmp_path / "snapshot.last_good.json",
+            universe_cache_dir=tmp_path,
+        )
+
+    assert result.attrs["snapshot_source"] == "tencent_etf"
+    tencent.assert_called_once_with(exchange)
+    sina.assert_not_called()
+
+
+def test_etf_snapshot_falls_back_to_sina_and_keeps_tencent_error(tmp_path: Path):
+    exchange = {
+        "510300": {"fund_type": "指数型-股票", "fund_shares": 1_000_000}
+    }
+    _write_json_cache(tmp_path / "cn_etf_exchange_universe.json", exchange)
+    with (
+        patch(
+            "src.services.screening.snapshot_etf._load_exchange_universe",
+            return_value=(exchange, "exchange_cache", []),
+        ),
+        patch(
+            "src.services.screening.snapshot_etf._load_fund_types",
+            return_value=({"510300": "指数型-股票"}, "fund_type_cache", []),
+        ),
+        patch(
+            "src.services.screening.snapshot_etf._fetch_tencent_etf_snapshot",
+            side_effect=RuntimeError("coverage too low"),
+        ) as tencent,
+        patch(
+            "src.services.screening.snapshot_etf._fetch_sina_etf_snapshot",
+            return_value=_snapshot(("510300", "沪深300ETF")),
+        ) as sina,
+    ):
+        result = fetch_etf_snapshot_with_fallback(
+            fallback_snapshot_path=tmp_path / "snapshot.last_good.json",
+            universe_cache_dir=tmp_path,
+        )
+
+    assert result.attrs["snapshot_source"] == "sina_etf"
+    assert "tencent_etf: coverage too low" in result.attrs["source_errors"]
+    tencent.assert_called_once_with(exchange)
+    sina.assert_called_once()
+
+
+def test_etf_snapshot_cold_start_uses_sina_to_enumerate_codes(tmp_path: Path):
+    with (
+        patch(
+            "src.services.screening.snapshot_etf._load_exchange_universe",
+            return_value=({}, "strict_taxonomy", ["offline"]),
+        ),
+        patch(
+            "src.services.screening.snapshot_etf._load_fund_types",
+            return_value=({}, "", ["offline"]),
+        ),
+        patch("src.services.screening.snapshot_etf._fetch_tencent_etf_snapshot") as tencent,
+        patch(
+            "src.services.screening.snapshot_etf._fetch_sina_etf_snapshot",
+            return_value=_snapshot(("512480", "半导体ETF")),
+        ) as sina,
+    ):
+        result = fetch_etf_snapshot_with_fallback(
+            fallback_snapshot_path=tmp_path / "snapshot.last_good.json",
+            universe_cache_dir=tmp_path,
+        )
+
+    assert result.attrs["snapshot_source"] == "sina_etf"
+    assert result.attrs["universe_mode"] == "conservative_fallback"
+    tencent.assert_not_called()
+    sina.assert_called_once()
 
 
 def test_tushare_etf_uses_fund_daily(monkeypatch: pytest.MonkeyPatch):

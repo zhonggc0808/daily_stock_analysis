@@ -11,7 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [文档] 部署指南（中英）补充云平台 IP 转发注意事项：Docker 容器出站依赖 `net.ipv4.ip_forward=1`，GCP 镜像的 `/etc/sysctl.d/60-gce-network-security.conf` 会在 sysctl 重载时将其重置为 0 导致容器全部外网请求失败（DNS/LLM/行情源），并给出检查与持久化修复命令
 
+- [修复] Docker Compose 恢复从仓库根目录 `.env` 启动，并将 Web 设置页配置持久化到 `data/runtime.env`，避免首次部署因缺失 `data/.env` 而失败
 - [新功能] 选股新增独立 `cn_etf` 市场池与三套 ETF 策略，使用交易所资格清单和境内指数主题分类，采用新浪快照、腾讯/新浪日线及独立缓存链路，并在 Web 展示 ETF 主题与市场池诊断
+- [改进] A 股 ETF 在交易所或缓存代码池可用时优先使用腾讯批量快照，并以共享超时和 95% 覆盖率护栏回退新浪；冷启动仍由新浪枚举代码
+- [修复] Web 将 ETF 主题去重数量不足的内部诊断合并为中文业务提示，将 camelCase 因子及内置风险字段统一显示为中文，并去除本地与 LLM 重复风险标签
 
 - [新功能] Agent Chat 按会话持久化 Skill 选择，支持刷新和会话切换恢复，并区分省略 `skills`、显式空列表与非空选择；无持久化状态的历史会话继续使用运行时默认且不会被静默转为显式选择，复用分析 `context` 中残留的 legacy `skills` / `strategies` 也不会覆盖顶层三态或会话状态，非空但全部无效的 Skill 请求不会被当成显式空列表并清空既有选择
 - [改进] 后端 CI 在不跳过离线测试的前提下按完整测试文件分成三个独立 runner 并行执行，由单一 `backend-gate` 汇总门禁结果；实测文件耗时和首分片静态检查成本共同参与负载平衡，新测试文件自动纳入，现有 pip 安装和测试参数保持不变，避免 xdist 进程内并发的全局状态竞态。

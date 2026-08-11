@@ -16,8 +16,8 @@ x-common: &common
     dockerfile: docker/Dockerfile
   restart: unless-stopped
 
-  # 环境变量（从 .env 文件加载）。不要将 ../.env 作为单文件 volume 挂载到 /app/.env，
-  # 否则 Docker mount point 会阻止配置保存时的 os.replace 原子更新。
+  # 启动环境变量从仓库根目录 .env 加载。不要将 .env 作为单文件 volume
+  # 挂载到 /app/.env，否则 mount point 会阻止配置保存时的 os.replace 原子更新。
   env_file:
     - ../.env
 
@@ -38,6 +38,10 @@ x-common: &common
     # Web/API service bind address (must be 0.0.0.0 inside container)
     - WEBUI_HOST=0.0.0.0
     # API_PORT 从 .env 文件读取，无需在此硬编码
+
+    # 设置页保存的配置（选股开关、LLM keys 等）写入持久化数据目录；
+    # 容器重建后仍保留，但启动时显式注入的同名环境变量优先级更高。
+    - ENV_FILE=/app/data/runtime.env
 
     # 代理设置（如果需要）
     # - http_proxy=http://host.docker.internal:10809

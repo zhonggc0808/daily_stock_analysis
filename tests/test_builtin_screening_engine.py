@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient as FastAPITestClient
 
 from api.v1.router import router
 from src.services.screening import REFERENCE_REVISION
+from src.services.screening import dsa as screening_dsa
 from src.services.screening.dsa_provider import apply_dsa_provider_context
 from src.services.screening import pipeline as screening_pipeline
 from src.services.screening import post_analysis as screening_post_analysis
@@ -533,6 +534,153 @@ def test_dsa_provider_context_respects_host_max_candidates_setting() -> None:
     assert all(pick.dsa_context.get("enriched") is True for pick in picks[:3])
     assert all(pick.dsa_context == {} for pick in picks[3:])
     assert notes == ["DSA provider context applied 3 of 3 candidates"]
+
+
+def test_dsa_provider_context_calls_host_provider_sequentially() -> None:
+    picks = [
+        Pick(
+            rank=index + 1,
+            code=f"00000{index + 1}",
+            name=f"Stock {index + 1}",
+            final_score=0.0,
+            screen_score=0.0,
+        )
+        for index in range(3)
+    ]
+    requested_codes: list[str] = []
+    active = False
+
+    def get_candidate_context(code: str, _name: str) -> dict[str, object]:
+        nonlocal active
+        assert active is False
+        active = True
+        requested_codes.append(code)
+        active = False
+        return {"enriched": True, "quote": {"price": 10.0}}
+
+    notes = apply_dsa_provider_context(
+        picks,
+        {"dsa": {"get_candidate_context": get_candidate_context}},
+    )
+
+    assert requested_codes == ["000001", "000002", "000003"]
+    assert notes == ["DSA provider context applied 3 of 3 candidates"]
+
+
+def test_dsa_empty_dict_response_is_completed(monkeypatch) -> None:
+    pick = Pick(
+        rank=1,
+        code="000001",
+        name="Stock 1",
+        final_score=0.0,
+        screen_score=0.0,
+    )
+    monkeypatch.setattr(screening_dsa, "call_dsa_analysis", lambda *_args, **_kwargs: {})
+
+    picks, degradation = screening_dsa.analyze_picks_with_dsa(
+        [pick],
+        run_id="run-1",
+        api_url="http://dsa.example",
+    )
+
+    assert degradation == []
+    assert picks[0].deep_analysis_status == "completed"
+    assert picks[0].deep_analysis_result == {}
+    assert picks[0].deep_analysis_error == ""
+
+
+def test_dsa_parallel_failures_are_reported_in_candidate_order(monkeypatch) -> None:
+    picks = [
+        Pick(
+            rank=index + 1,
+            code=f"00000{index + 1}",
+            name=f"Stock {index + 1}",
+            final_score=0.0,
+            screen_score=0.0,
+        )
+        for index in range(3)
+    ]
+
+    def fail_analysis(*_args, stock_code: str, **_kwargs) -> dict:
+        raise RuntimeError(f"failed-{stock_code}")
+
+    monkeypatch.setattr(screening_dsa, "call_dsa_analysis", fail_analysis)
+
+    _, degradation = screening_dsa.analyze_picks_with_dsa(
+        picks,
+        run_id="run-2",
+        api_url="http://dsa.example",
+        max_picks=3,
+    )
+
+    assert degradation == [
+        "DSA deep analysis failed for 000001: failed-000001",
+        "DSA deep analysis failed for 000002: failed-000002",
+        "DSA deep analysis failed for 000003: failed-000003",
+    ]
+
+
+def test_sina_snapshot_ignores_failed_tail_page_after_terminal_page(monkeypatch) -> None:
+    class Response:
+        status_code = 200
+
+        def __init__(self, items: list[dict[str, object]]) -> None:
+            self._items = items
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[dict[str, object]]:
+            return self._items
+
+    called_pages: list[int] = []
+
+    def fake_get(_url: str, *, params: dict[str, object], **_kwargs) -> Response:
+        page = int(params["page"])
+        called_pages.append(page)
+        if page == 4:
+            raise RuntimeError("irrelevant tail page failed")
+        size = 100 if page in (1, 3) else 1
+        return Response([{"code": f"{page:02d}-{idx:03d}"} for idx in range(size)])
+
+    monkeypatch.setattr(screening_snapshot.requests, "get", fake_get)
+    monkeypatch.setattr(screening_snapshot.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(screening_snapshot, "_normalize", lambda frame, *, source: frame)
+
+    result = screening_snapshot._fetch_sina()
+
+    assert len(result) == 101
+    assert set(called_pages) == {1, 2, 3, 4}
+    assert max(called_pages) == 4
+
+
+def test_em_datacenter_uses_hardened_serial_request_path(monkeypatch) -> None:
+    class Response:
+        def __init__(self, page: int) -> None:
+            self.page = page
+
+        def json(self) -> dict[str, object]:
+            items = [{"code": f"item-{self.page}"}]
+            return {"success": True, "result": {"data": items, "count": 501}}
+
+    requested_pages: list[str] = []
+
+    def fake_eastmoney_get(_url: str, *, params: dict[str, str], **_kwargs) -> Response:
+        requested_pages.append(params["p"])
+        return Response(int(params["p"]))
+
+    monkeypatch.setattr(screening_snapshot, "_eastmoney_get", fake_eastmoney_get)
+    monkeypatch.setattr(
+        screening_snapshot.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct GET used")),
+    )
+    monkeypatch.setattr(screening_snapshot, "_normalize", lambda frame, *, source: frame)
+
+    result = screening_snapshot._fetch_em_datacenter()
+
+    assert requested_pages == ["1", "2"]
+    assert result["code"].tolist() == ["item-1", "item-2"]
 
 
 def test_hard_filter_and_factor_scoring_keep_core_semantics() -> None:

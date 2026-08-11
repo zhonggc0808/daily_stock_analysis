@@ -75,6 +75,20 @@ vi.mock('../../api/screening', () => ({
     screen: (payload: unknown) => screenStocks(payload),
     startScreen: (payload: unknown) => startScreenTask(payload),
   },
+  clearPersistedScreeningResult: () => {
+    window.localStorage.removeItem('dsa.screening.lastResult.v1');
+  },
+  persistScreeningResult: (result: unknown) => {
+    window.localStorage.setItem('dsa.screening.lastResult.v1', JSON.stringify({ savedAt: Date.now(), result }));
+  },
+  readPersistedScreeningResult: () => {
+    try {
+      const raw = window.localStorage.getItem('dsa.screening.lastResult.v1');
+      return raw ? (JSON.parse(raw) as { savedAt: number; result: unknown }) : null;
+    } catch {
+      return null;
+    }
+  },
 }));
 
 const mockStrategiesResponse = {
@@ -144,6 +158,7 @@ describe('StockScreeningPage', () => {
     });
     getHotspots.mockResolvedValue({ enabled: true, provider: 'akshare', hotspots: [], hotspotCount: 0 });
     window.sessionStorage.clear();
+    window.localStorage.clear();
   });
 
   it('keeps implementation attribution and repeated guidance off the operation page', async () => {
@@ -1348,6 +1363,87 @@ describe('StockScreeningPage', () => {
     expect(screen.getByText('stock_news_unavailable')).toBeInTheDocument();
   });
 
+  it('restores the latest same-day screening result after remounting', async () => {
+    getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
+    window.localStorage.setItem(
+      'dsa.screening.lastResult.v1',
+      JSON.stringify({
+        savedAt: Date.now(),
+        result: {
+          enabled: true,
+          candidates: [
+            { rank: 1, code: '600036', name: '招商银行', score: 90, reason: '银行低估', raw: {} },
+          ],
+          candidateCount: 1,
+        },
+      }),
+    );
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    expect(await screen.findByText('招商银行')).toBeInTheDocument();
+    expect(screen.getByText('选股完成')).toBeInTheDocument();
+  });
+
+  it('drops an expired screening result from a previous day', async () => {
+    getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
+    window.localStorage.setItem(
+      'dsa.screening.lastResult.v1',
+      JSON.stringify({
+        savedAt: Date.now() - 48 * 60 * 60 * 1000,
+        result: {
+          enabled: true,
+          candidates: [
+            { rank: 1, code: '600036', name: '招商银行', score: 90, reason: '昨日推荐', raw: {} },
+          ],
+          candidateCount: 1,
+        },
+      }),
+    );
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    expect(screen.queryByText('招商银行')).not.toBeInTheDocument();
+    expect(window.localStorage.getItem('dsa.screening.lastResult.v1')).toBeNull();
+  });
+
+  it('re-invokes screening and replaces the restored result on a new run', async () => {
+    getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
+    window.localStorage.setItem(
+      'dsa.screening.lastResult.v1',
+      JSON.stringify({
+        savedAt: Date.now(),
+        result: {
+          enabled: true,
+          candidates: [
+            { rank: 1, code: '000001', name: '旧推荐', score: 80, reason: 'old', raw: {} },
+          ],
+          candidateCount: 1,
+        },
+      }),
+    );
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      candidates: [
+        { rank: 1, code: '600036', name: '招商银行', score: 92, reason: '最新结果', raw: {} },
+      ],
+      candidateCount: 1,
+    });
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    expect(await screen.findByText('旧推荐')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+
+    expect(screen.queryByText('旧推荐')).not.toBeInTheDocument();
+    expect(await screen.findByText('招商银行')).toBeInTheDocument();
+    expect(screen.getByText('选股完成')).toBeInTheDocument();
+  });
+
   it('filters ETF strategies, displays themes, and hides stock-only actions', async () => {
     getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
     getStrategies.mockResolvedValueOnce({
@@ -1376,10 +1472,26 @@ describe('StockScreeningPage', () => {
         themeName: '半导体',
         score: 88,
         reason: '趋势稳定',
+        factorScores: {
+          liquidity: 90,
+          themeHeat: 50,
+          topicAlignment: 50,
+        },
+        riskFlags: [
+          '20日波动率49.96%，20日最大回撤-9.10%，买卖价差10.89bps，daily_quality_flags为unadjusted_fallback',
+          'low_daily_quality',
+        ],
+        llmRisks: [
+          '20日波动率49.96%，20日最大回撤-9.10%，买卖价差10.89bps，daily_quality_flags为unadjusted_fallback',
+        ],
         raw: {},
       }],
       candidateCount: 1,
       universeMode: 'authoritative',
+      warnings: [
+        'ETF theme dedup kept 3 of 6 candidates',
+        'insufficient_distinct_themes: requested=10, returned=3',
+      ],
     });
 
     render(<StockScreeningPage />);
@@ -1393,6 +1505,20 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('半导体ETF')).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: '主题' })).toBeInTheDocument();
     expect(screen.getByText('半导体')).toBeInTheDocument();
+    expect(screen.getByText('题材热度')).toBeInTheDocument();
+    expect(screen.getByText('题材匹配')).toBeInTheDocument();
+    expect(screen.queryByText('themeHeat')).not.toBeInTheDocument();
+    expect(screen.queryByText('topicAlignment')).not.toBeInTheDocument();
+    expect(
+      screen.getByText('20日波动率49.96%，20日最大回撤-9.10%，买卖价差10.89 个基点，日线使用未复权备用数据，日线数据质量较低'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/daily_quality_flags/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unadjusted_fallback/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText('本次符合策略条件且主题互不重复的 ETF 只有 3 只，少于请求的 10 只；已按每个主题评分最高的 1 只返回。'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/ETF theme dedup/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/insufficient_distinct_themes/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '进一步深度分析' })).not.toBeInTheDocument();
   });
 });

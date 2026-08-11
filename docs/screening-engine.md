@@ -20,11 +20,11 @@ DSA 将选股能力作为主项目的一部分维护。实现参考 [AlphaSift](
 
 分类源异常时依次使用资格缓存、交易所缓存和严格主题正向词典。不能明确识别的标的不进入池，但不会中止整批任务。结果通过 `universe_source`、`universe_mode`、`unclassified_count` 和 `exclusion_counts` 区分权威模式与保守降级模式。
 
-ETF 快照链为 `Sina ETF -> AkShare ETF -> cn_etf last-good`。日线自动链为 `Tencent qfq -> Sina unadjusted -> AkShare fund_etf_hist_em(qfq)`，不使用 Baostock；显式 Tushare 路径调用 `fund_daily`。新浪未复权日线标记 `unadjusted_fallback`，快照、资格和日线缓存均与普通 A 股隔离。
+ETF 快照在交易所资格清单或其缓存可用时采用 `Tencent batch -> Sina ETF -> AkShare ETF -> cn_etf last-good`；腾讯每批查询 150 只，整批覆盖率不足 95% 或超过共享总截止时间时回退新浪。冷启动没有 ETF 代码清单时仍由新浪枚举代码，不把腾讯批量行情误当成市场池发现接口。日线自动链为 `Tencent qfq -> Sina unadjusted -> AkShare fund_etf_hist_em(qfq)`，不使用 Baostock；显式 Tushare 路径调用 `fund_daily`。新浪未复权日线标记 `unadjusted_fallback`，快照、资格和日线缓存均与普通 A 股隔离。
 
-硬筛选后先按细分 `theme_key` 保留前三只，再把日线增强池限制为全局 60 只。最终评分后每个主题只保留一只，同分依次按成交额、基金规模和代码裁决；主题不足时允许少于请求数量，并记录 `insufficient_distinct_themes`。ETF 不执行公司基本面、公告、个股新闻、DSA 深度分析或大盘上下文流程。
+硬筛选后先按细分 `theme_key` 保留前三只，再把日线增强池限制为全局 60 只。最终评分后每个主题只保留一只，同分依次按成交额、基金规模和代码裁决；主题不足时允许少于请求数量，并记录 `insufficient_distinct_themes`，Web 将其展示为包含请求数与实际返回数的中文说明。ETF 不执行公司基本面、公告、个股新闻、DSA 深度分析或大盘上下文流程。
 
-内置策略为 `etf_trend`、`etf_low_volatility` 和 `etf_oversold_recovery`。LLM 只接收实际存在的主题、成交额、价差、规模、趋势、波动、回撤与数据质量；费率和跟踪误差等缺失字段保持未知。
+内置策略为 `etf_trend`、`etf_low_volatility` 和 `etf_oversold_recovery`。Web 使用中文展示 ETF 因子与内置风险名称，包括题材热度、题材匹配和日线质量状态；本地风险与 LLM 风险合并展示时按规范化文本去重。LLM 只接收实际存在的主题、成交额、价差、规模、趋势、波动、回撤与数据质量；费率和跟踪误差等缺失字段保持未知。
 
 ## 配置
 

@@ -2473,8 +2473,26 @@ class DataFetcherManager:
                 except Exception as e:
                     logger.warning(f"[TickFlowFetcher] 获取指数行情失败: {e}")
 
+        # The Sina-based Akshare index source returns complete CN change_pct
+        # data on non-trading days, while Eastmoney-based sources can return
+        # zeros. This preference is CN-only; other regions keep configured order.
+        preferred_name = "AkshareFetcher"
+        if region == "cn":
+            for fetcher in self._fetchers:
+                if fetcher.name == preferred_name:
+                    try:
+                        data = fetcher.get_main_indices(region=region)
+                        if data:
+                            logger.info(f"[{fetcher.name}] 获取指数行情成功")
+                            return data
+                    except Exception as e:
+                        logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
+                    break
+
         for fetcher in self._fetchers:
             if region == "cn" and fetcher.name == "TickFlowFetcher":
+                continue
+            if region == "cn" and fetcher.name == preferred_name:
                 continue
             try:
                 data = fetcher.get_main_indices(region=region)

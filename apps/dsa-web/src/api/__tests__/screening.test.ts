@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { screeningApi } from '../screening';
+import {
+  readPersistedScreeningResult,
+  SCREENING_RESULT_STORAGE_KEY,
+  screeningApi,
+} from '../screening';
 
 const { get, post, getConfig, updateConfig } = vi.hoisted(() => ({
   get: vi.fn(),
@@ -30,6 +34,20 @@ describe('screeningApi', () => {
     updateConfig.mockReset();
     window.localStorage.clear();
     window.localStorage.setItem('dsa.screening.variantSeed.v1', 'browser-seed');
+  });
+
+  it('removes malformed persisted screening results', () => {
+    window.localStorage.setItem(SCREENING_RESULT_STORAGE_KEY, '{"savedAt":"bad"}');
+
+    expect(readPersistedScreeningResult()).toBeNull();
+    expect(window.localStorage.getItem(SCREENING_RESULT_STORAGE_KEY)).toBeNull();
+  });
+
+  it('removes persisted screening results with invalid JSON', () => {
+    window.localStorage.setItem(SCREENING_RESULT_STORAGE_KEY, '{bad json');
+
+    expect(readPersistedScreeningResult()).toBeNull();
+    expect(window.localStorage.getItem(SCREENING_RESULT_STORAGE_KEY)).toBeNull();
   });
 
   it('enables the config and checks built-in screening availability', async () => {

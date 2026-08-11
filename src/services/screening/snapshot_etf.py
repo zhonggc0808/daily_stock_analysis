@@ -20,6 +20,9 @@ import requests
 logger = logging.getLogger(__name__)
 
 _CACHE_VERSION = 1
+_TENCENT_BATCH_SIZE = 150
+_TENCENT_TOTAL_TIMEOUT_SECONDS = 15.0
+_TENCENT_MIN_COVERAGE = 0.95
 _EXCLUDED_EXPOSURE = (
     "港股通", "港股", "香港", "恒生", "沪港深", "纳斯达克", "纳指", "标普500",
     "日经", "德国", "法国", "沙特", "印度", "东南亚", "海外", "全球", "QDII",
@@ -124,23 +127,28 @@ def fetch_etf_snapshot_with_fallback(
     from src.services.screening.snapshot import _read_last_good_snapshot, _write_last_good_snapshot
 
     required = required_columns or []
-    sources: tuple[tuple[str, Callable[[], pd.DataFrame]], ...] = (
-        ("sina_etf", _fetch_sina_etf_snapshot),
-        ("akshare_etf", _fetch_akshare_etf_snapshot),
-    )
+    cached_exchange_rows = _read_json_cache(_exchange_universe_cache_path(universe_cache_dir))
+    cached_sources = _etf_snapshot_sources(cached_exchange_rows)
     if cache_ttl_seconds > 0:
         cached = _read_last_good_snapshot(
             cache_path, required_columns=required, source_errors=[],
             max_age_hours=cache_ttl_seconds / 3600, fresh=True,
-            requested_snapshot_sources=[item[0] for item in sources],
+            requested_snapshot_sources=[item[0] for item in cached_sources],
         )
         if cached is not None:
             return cached
+
+    exchange_universe = _load_exchange_universe(universe_cache_dir)
+    sources = _etf_snapshot_sources(exchange_universe[0])
     errors: list[str] = []
     for source, fetcher in sources:
         try:
             snapshot = fetcher()
-            qualified = qualify_etf_snapshot(snapshot, cache_dir=universe_cache_dir)
+            qualified = qualify_etf_snapshot(
+                snapshot,
+                cache_dir=universe_cache_dir,
+                exchange_universe=exchange_universe,
+            )
             missing = [column for column in required if column not in qualified or qualified[column].dropna().empty]
             if qualified.empty or missing:
                 raise RuntimeError(f"empty or missing columns: {','.join(missing)}")
@@ -160,8 +168,38 @@ def fetch_etf_snapshot_with_fallback(
     raise RuntimeError(f"All ETF snapshot sources failed: {'; '.join(errors)}")
 
 
-def qualify_etf_snapshot(df: pd.DataFrame, *, cache_dir: str | Path | None = None) -> pd.DataFrame:
-    exchange_rows, exchange_mode, exchange_errors = _load_exchange_universe(cache_dir)
+def _etf_snapshot_sources(
+    exchange_rows: dict[str, object],
+) -> tuple[tuple[str, Callable[[], pd.DataFrame]], ...]:
+    sources: list[tuple[str, Callable[[], pd.DataFrame]]] = []
+    if exchange_rows:
+        sources.append(
+            (
+                "tencent_etf",
+                lambda rows=exchange_rows: _fetch_tencent_etf_snapshot(rows),
+            )
+        )
+    sources.extend(
+        (
+            ("sina_etf", _fetch_sina_etf_snapshot),
+            ("akshare_etf", _fetch_akshare_etf_snapshot),
+        )
+    )
+    return tuple(sources)
+
+
+def qualify_etf_snapshot(
+    df: pd.DataFrame,
+    *,
+    cache_dir: str | Path | None = None,
+    exchange_universe: tuple[dict[str, dict[str, object]], str, list[str]] | None = None,
+) -> pd.DataFrame:
+    input_attrs = dict(df.attrs)
+    exchange_rows, exchange_mode, exchange_errors = (
+        exchange_universe
+        if exchange_universe is not None
+        else _load_exchange_universe(cache_dir)
+    )
     fund_types, type_mode, type_errors = _load_fund_types(cache_dir)
     eligible_codes = set(exchange_rows)
     authoritative = bool(eligible_codes)
@@ -209,6 +247,7 @@ def qualify_etf_snapshot(df: pd.DataFrame, *, cache_dir: str | Path | None = Non
         })
         rows.append(row)
     result = pd.DataFrame(rows)
+    result.attrs.update(input_attrs)
     result.attrs["universe_source"] = "+".join(item for item in (exchange_mode, type_mode) if item)
     result.attrs["universe_mode"] = "authoritative" if authoritative else "conservative_fallback"
     result.attrs["unclassified_count"] = unclassified
@@ -236,6 +275,112 @@ def _fetch_sina_etf_snapshot() -> pd.DataFrame:
     return _ensure_stock_compatible_columns(result)
 
 
+def _fetch_tencent_etf_snapshot(exchange_rows: dict[str, object]) -> pd.DataFrame:
+    codes = sorted({_code(value) for value in exchange_rows if _code(value)})
+    if not codes:
+        raise RuntimeError("Tencent ETF snapshot requires a non-empty ETF code universe")
+
+    deadline = time.monotonic() + _TENCENT_TOTAL_TIMEOUT_SECONDS
+    records: dict[str, dict[str, object]] = {}
+    batch_count = 0
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Referer": "https://gu.qq.com/",
+            "User-Agent": "Mozilla/5.0",
+        }
+    )
+    try:
+        for offset in range(0, len(codes), _TENCENT_BATCH_SIZE):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Tencent ETF snapshot exceeded {_TENCENT_TOTAL_TIMEOUT_SECONDS:.0f}s total timeout"
+                )
+            batch_codes = codes[offset:offset + _TENCENT_BATCH_SIZE]
+            symbols = [_to_tencent_etf_symbol(code) for code in batch_codes]
+            symbol_to_code = dict(zip(symbols, batch_codes))
+            response = session.get(
+                "https://qt.gtimg.cn/q=" + ",".join(symbols),
+                timeout=(max(0.1, min(3.0, remaining)), max(0.1, min(5.0, remaining))),
+            )
+            response.raise_for_status()
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Tencent ETF snapshot exceeded {_TENCENT_TOTAL_TIMEOUT_SECONDS:.0f}s total timeout"
+                )
+            batch_count += 1
+            for line in response.content.decode("gbk", errors="replace").split(";"):
+                if '="' not in line:
+                    continue
+                symbol = line.split("=", 1)[0].rsplit("_", 1)[-1]
+                code = symbol_to_code.get(symbol)
+                if code is None:
+                    continue
+                payload = line.split('"', 2)
+                if len(payload) < 2:
+                    continue
+                fields = payload[1].split("~")
+                if len(fields) < 53 or not fields[2]:
+                    continue
+                records[code] = {
+                    "code": code,
+                    "name": fields[1],
+                    "price": _tencent_number(fields, 3),
+                    "change_pct": _tencent_number(fields, 32),
+                    "amount": _tencent_amount(fields),
+                    "volume": _tencent_volume(fields),
+                    "bid": _tencent_number(fields, 9),
+                    "ask": _tencent_number(fields, 19),
+                }
+    finally:
+        session.close()
+
+    coverage = len(records) / len(codes)
+    if coverage < _TENCENT_MIN_COVERAGE:
+        raise RuntimeError(
+            "Tencent ETF snapshot coverage too low: "
+            f"returned={len(records)} requested={len(codes)} coverage={coverage:.1%}"
+        )
+    result = _ensure_stock_compatible_columns(pd.DataFrame(records.values()))
+    result.attrs.update(
+        {
+            "requested_code_count": len(codes),
+            "returned_code_count": len(records),
+            "batch_count": batch_count,
+        }
+    )
+    return result
+
+
+def _to_tencent_etf_symbol(code: str) -> str:
+    return f"sh{code}" if code.startswith("5") else f"sz{code}"
+
+
+def _tencent_number(fields: list[str], index: int) -> float | None:
+    if len(fields) <= index or not fields[index]:
+        return None
+    value = pd.to_numeric(fields[index], errors="coerce")
+    return float(value) if pd.notna(value) else None
+
+
+def _tencent_amount(fields: list[str]) -> float | None:
+    if len(fields) > 35 and fields[35]:
+        parts = fields[35].split("/")
+        if len(parts) >= 3:
+            value = pd.to_numeric(parts[2], errors="coerce")
+            if pd.notna(value):
+                return float(value)
+    fallback = _tencent_number(fields, 37)
+    return fallback * 10_000 if fallback is not None else None
+
+
+def _tencent_volume(fields: list[str]) -> float | None:
+    # Tencent's ETF quote payload reports field 6 in lots.
+    volume_lots = _tencent_number(fields, 6)
+    return volume_lots * 100 if volume_lots is not None else None
+
+
 def _fetch_akshare_etf_snapshot() -> pd.DataFrame:
     import akshare as ak
     raw = ak.fund_etf_spot_em()
@@ -258,7 +403,7 @@ def _ensure_stock_compatible_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_exchange_universe(cache_dir: str | Path | None) -> tuple[dict[str, dict[str, object]], str, list[str]]:
-    cache = Path(cache_dir or ".cache/screening") / "cn_etf_exchange_universe.json"
+    cache = _exchange_universe_cache_path(cache_dir)
     errors: list[str] = []
     rows: dict[str, dict[str, object]] = {}
     try:
@@ -294,6 +439,10 @@ def _load_exchange_universe(cache_dir: str | Path | None) -> tuple[dict[str, dic
         errors.append(f"exchange universe: {exc}")
         cached = _read_json_cache(cache)
         return cached, "exchange_cache" if cached else "strict_taxonomy", errors
+
+
+def _exchange_universe_cache_path(cache_dir: str | Path | None) -> Path:
+    return Path(cache_dir or ".cache/screening") / "cn_etf_exchange_universe.json"
 
 
 def _fetch_szse_etf_list_direct() -> pd.DataFrame:

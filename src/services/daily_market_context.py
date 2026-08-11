@@ -147,7 +147,8 @@ class DailyMarketContextService:
                 cached,
                 current_query_id=current_query_id,
             ):
-                return cached
+                if _context_fresh_enough(getattr(cached, "created_at", None)):
+                    return cached
 
             if cached is not None:
                 self._cache.pop(cache_key, None)
@@ -198,7 +199,8 @@ class DailyMarketContextService:
                     cached,
                     current_query_id=current_query_id,
                 ):
-                    return cached
+                    if _context_fresh_enough(getattr(cached, "created_at", None)):
+                        return cached
                 if cached is not None:
                     self._cache.pop(cache_key, None)
                 runtime_context = self._load_current_query_runtime_cache(
@@ -279,6 +281,16 @@ class DailyMarketContextService:
                 require_query_id_match=require_query_id_match,
                 report_language=report_language,
             ):
+                continue
+            # During the trading session an earlier intraday snapshot can be
+            # stale (quotes keep moving), so require a recent record then; after
+            # close / on non-trading days the same-day record is stable.
+            if not _context_fresh_enough(getattr(record, "created_at", None)):
+                logger.info(
+                    "跳过过期的大盘上下文缓存（盘中数据已变化）: record_id=%s created=%s",
+                    getattr(record, "id", None),
+                    getattr(record, "created_at", None),
+                )
                 continue
 
             context = self._build_context_from_payload(
@@ -840,8 +852,52 @@ def _record_matches_target_date(
     if require_query_id_match:
         return _record_matches_query_id(record, current_query_id) and language_matches
     return language_matches and (
-        created_date == target_date or _record_matches_query_id(record, current_query_id)
+        created_date == target_date
+        or _record_matches_query_id(record, current_query_id)
     )
+
+
+_INTRADAY_MARKET_CONTEXT_TTL_SECONDS = 900
+
+
+def _is_intraday_market_open(now: Optional[datetime] = None) -> bool:
+    """True while the CN regular session is open (market context data is live)."""
+    try:
+        from src.core.trading_calendar import MarketPhase, infer_market_phase
+
+        phase = infer_market_phase("cn", current_time=now)
+        return phase in (MarketPhase.INTRADAY, MarketPhase.CLOSING_AUCTION)
+    except Exception:
+        # Fail closed: when we cannot tell, treat as not-intraday so the
+        # persisted same-day context stays reusable.
+        return False
+
+
+def _context_fresh_enough(created_at: Any, now: Optional[datetime] = None) -> bool:
+    """Decide whether a persisted market context is fresh enough to reuse.
+
+    During the trading session quotes change continuously, so an intraday
+    context must be recent (short TTL). Outside the session (after close,
+    weekends, before open) the persisted context for the day/last trading day
+    is stable and safe to reuse.
+    """
+    if created_at is None:
+        return False
+    try:
+        comparison_now = now or datetime.now()
+        age_seconds = (comparison_now - created_at).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    if comparison_now.date() != created_at.date():
+        return True
+    if age_seconds < 0:
+        age_seconds = 0.0
+    # With no injected clock, let the calendar obtain current Shanghai time.
+    # Database history uses naive datetime.now(), so its age comparison above
+    # deliberately stays on the server-local naive clock.
+    if _is_intraday_market_open(now=now):
+        return age_seconds <= _INTRADAY_MARKET_CONTEXT_TTL_SECONDS
+    return True
 
 
 def _record_report_language_matches(record: Any, report_language: str) -> bool:

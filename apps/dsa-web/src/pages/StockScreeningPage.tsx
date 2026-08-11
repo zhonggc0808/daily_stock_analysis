@@ -28,6 +28,9 @@ import {
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import {
+  clearPersistedScreeningResult,
+  persistScreeningResult,
+  readPersistedScreeningResult,
   screeningApi,
   type ScreeningCandidate,
   type ScreeningHotspotDetail,
@@ -114,6 +117,17 @@ const clearPersistedScreenTask = () => {
   }
 };
 
+/** True when two epoch-millisecond timestamps fall on the same local calendar day. */
+const isSameLocalDay = (a: number, b: number): boolean => {
+  const dayA = new Date(a);
+  const dayB = new Date(b);
+  return (
+    dayA.getFullYear() === dayB.getFullYear()
+    && dayA.getMonth() === dayB.getMonth()
+    && dayA.getDate() === dayB.getDate()
+  );
+};
+
 const isUnrecoverableScreenTaskError = (error: ParsedApiError) =>
   error.title === '选股任务不可恢复';
 
@@ -174,11 +188,73 @@ const FACTOR_LABELS: Record<string, string> = {
   topic_alignment: '题材匹配',
 };
 
+const getFactorLabel = (key: string) => {
+  const normalizedKey = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase();
+  return FACTOR_LABELS[normalizedKey] || key;
+};
+
 const POST_TAG_LABELS: Record<string, string> = {
   value_quality: '价值质量',
   controlled_reversal: '受控反转',
   momentum: '趋势动量',
   liquidity: '流动性',
+};
+
+const RISK_FLAG_LABELS: Record<string, string> = {
+  abnormal_volume_ratio: '量比异常偏高',
+  bad_daily_quality_flags: '日线数据存在异常',
+  daily_fetch_failed: '日线数据获取失败',
+  daily_source_fallback_errors: '日线数据源发生降级',
+  daily_stale_cache: '日线使用过期缓存',
+  high_pb: '市净率偏高',
+  high_turnover: '换手率偏高',
+  hot_money_instability: '短线资金活跃但稳定性不足',
+  low_daily_quality: '日线数据质量较低',
+  low_llm_confidence: '智能判断置信度较低',
+  macd_bearish: 'MACD 偏空',
+  negative_or_invalid_pe: '市盈率为负或数据异常',
+  rsi_overbought: 'RSI 进入超买区间',
+  single_day_breakdown_risk: '单日跌幅较大',
+  single_day_chase_risk: '单日涨幅较高，存在追涨风险',
+  volume_spike: '成交量异常放大',
+  weak_daily_signal: '日线信号较弱',
+};
+
+const formatRiskFlag = (value: string) => {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+  const knownLabel = RISK_FLAG_LABELS[text.toLowerCase()];
+  if (knownLabel) {
+    return knownLabel;
+  }
+  const portfolioConcentration = text.match(/^portfolio_sector_concentration\s*:\s*(.+)$/i);
+  if (portfolioConcentration) {
+    return `组合行业集中度较高：${portfolioConcentration[1]}`;
+  }
+  return text
+    .replace(/daily_quality_flags\s*(?:为|=|:)\s*unadjusted_fallback/gi, '日线使用未复权备用数据')
+    .replace(/daily_quality_flags/gi, '日线质量标记')
+    .replace(/unadjusted_fallback/gi, '未复权备用数据')
+    .replace(/(-?\d+(?:\.\d+)?)\s*bps\b/gi, '$1 个基点');
+};
+
+const getRiskLabels = (item: ScreeningCandidate) => {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  [...(item.riskFlags || []), ...(item.llmRisks || [])].forEach((value) => {
+    const label = formatRiskFlag(value);
+    const key = label.replace(/[\s,，。;；]/g, '').toLowerCase();
+    if (!label || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    labels.push(label);
+  });
+  return labels;
 };
 
 const HOTSPOT_QUALITY_LABELS: Record<string, string> = {
@@ -243,7 +319,7 @@ const getLocalFactorReason = (item: ScreeningCandidate) => {
     .filter(([, value]) => typeof value === 'number')
     .sort((a, b) => Number(b[1]) - Number(a[1]))
     .slice(0, 3)
-    .map(([key, value]) => `${FACTOR_LABELS[key] || key} ${Number(value).toFixed(0)}`);
+    .map(([key, value]) => `${getFactorLabel(key)} ${Number(value).toFixed(0)}`);
   const tags = (item.postAnalysisTags || [])
     .slice(0, 2)
     .map((tag) => POST_TAG_LABELS[tag] || tag);
@@ -373,6 +449,16 @@ const formatScreenMessage = (value: string) => {
   }
   if (/^(?:Remote post-analysis cap|Risk veto excluded|Snapshot hard-filter waterfall|Daily hard-filter waterfall|Daily hard-filter rejections|Candidate context collected rows=)/i.test(value)) {
     return '';
+  }
+  if (/^ETF theme dedup kept \d+ of \d+ candidates/i.test(value)) {
+    return '';
+  }
+  const insufficientEtfThemes = value.match(
+    /^insufficient_distinct_themes:\s*requested=(\d+),\s*returned=(\d+)$/i,
+  );
+  if (insufficientEtfThemes) {
+    const [, requested, returned] = insufficientEtfThemes;
+    return `本次符合策略条件且主题互不重复的 ETF 只有 ${returned} 只，少于请求的 ${requested} 只；已按每个主题评分最高的 1 只返回。`;
   }
   if (/^Daily K-line (?:enrichment attempted|sources|quality flags|source ordering|source health):?/i.test(value)) {
     return '';
@@ -1132,6 +1218,7 @@ const StockScreeningPage: React.FC = () => {
       if (task.status === 'completed') {
         if (task.result) {
           applyScreenResult(task.result);
+          persistScreeningResult(task.result);
           setError('');
         } else {
           setError('选股任务已完成，但服务端未返回候选结果。');
@@ -1195,6 +1282,26 @@ const StockScreeningPage: React.FC = () => {
       }
     };
   }, [activeTaskId, applyScreenResult]);
+
+  // Restore the most recent same-day screening result after navigating back to
+  // this page. Results are intentionally ephemeral: they are only meaningful
+  // for the calendar day they were generated, so expired entries are dropped.
+  useEffect(() => {
+    if (activeTaskId) {
+      return;
+    }
+    const persisted = readPersistedScreeningResult();
+    if (!persisted) {
+      return;
+    }
+    if (isSameLocalDay(persisted.savedAt, Date.now())) {
+      applyScreenResult(persisted.result);
+    } else {
+      clearPersistedScreeningResult();
+    }
+    // Only run once on mount; the saved result is a snapshot of the latest run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleEnable = async () => {
     setEnabling(true);
@@ -1260,6 +1367,8 @@ const StockScreeningPage: React.FC = () => {
         strategy,
         maxResults,
       });
+      // A new screening supersedes any previously restored same-day result.
+      clearPersistedScreeningResult();
       setActiveTaskId(task.taskId);
       setTaskProgress(0);
       setTaskMessage(task.message || '选股任务已提交');
@@ -1749,6 +1858,7 @@ const StockScreeningPage: React.FC = () => {
                   const dsaWarnings = item.dsaContext?.warnings || [];
                   const dsaNews = item.dsaNews || [];
                   const dsaEvents = item.dsaEvents || [];
+                  const riskLabels = getRiskLabels(item);
                   return (
                     <Fragment key={`${item.rank}-${item.code}`}>
                       <tr className="border-t border-border align-top transition-colors hover:bg-hover/50">
@@ -1815,9 +1925,7 @@ const StockScreeningPage: React.FC = () => {
                                 <div>
                                   <p className="text-xs font-semibold text-secondary-text">风险标签</p>
                                   <p className="mt-1 text-sm text-foreground">
-                                    {[...(item.riskFlags || []), ...(item.llmRisks || [])].length
-                                      ? [...(item.riskFlags || []), ...(item.llmRisks || [])].join('，')
-                                      : '无'}
+                                    {riskLabels.length ? riskLabels.join('，') : '无'}
                                   </p>
                                 </div>
                               </div>
@@ -1828,7 +1936,7 @@ const StockScreeningPage: React.FC = () => {
                                     {factors.length > 0 ? (
                                       factors.map(([key, value]) => (
                                         <div key={key} className="rounded-lg border border-border bg-card px-3 py-2">
-                                          <span className="block text-xs text-secondary-text">{FACTOR_LABELS[key] || key}</span>
+                                          <span className="block text-xs text-secondary-text">{getFactorLabel(key)}</span>
                                           <span className="text-sm font-semibold text-foreground">{formatNumber(value)}</span>
                                         </div>
                                       ))

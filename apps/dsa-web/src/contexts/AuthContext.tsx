@@ -2,6 +2,7 @@ import type React from 'react';
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { authApi } from '../api/auth';
+import { clearPersistedScreeningResult } from '../api/screening';
 import { useStockPoolStore } from '../stores';
 
 type AuthContextValue = {
@@ -59,6 +60,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSetupState(status.setupState);
       if (status.authEnabled && !status.loggedIn) {
         useStockPoolStore.getState().resetDashboardState();
+        clearPersistedScreeningResult();
       }
     } catch (err) {
       setLoadError(getParsedApiError(err));
@@ -68,6 +70,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setPasswordChangeable(false);
       setSetupState('no_password');
       useStockPoolStore.getState().resetDashboardState();
+      clearPersistedScreeningResult();
     } finally {
       setIsLoading(false);
     }
@@ -116,6 +119,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       logoutError = err;
     } finally {
+      clearPersistedScreeningResult();
       await fetchStatus();
     }
 

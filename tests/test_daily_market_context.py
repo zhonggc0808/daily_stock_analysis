@@ -516,6 +516,79 @@ def test_reuses_history_by_payload_trade_date_when_created_at_is_wall_clock_date
     run_review.assert_not_called()
 
 
+def test_does_not_reuse_history_from_adjacent_or_future_payload_date() -> None:
+    db = MagicMock()
+    db.get_analysis_history.return_value = [
+        _history_record(
+            created_at=datetime(2026, 6, 7, 9, 30),
+            payload_date="2026-06-07",
+            query_id="other-run-q",
+        ),
+        _history_record(
+            created_at=datetime(2026, 6, 5, 15, 30),
+            payload_date="2026-06-05",
+            query_id="older-run-q",
+        ),
+    ]
+    service = DailyMarketContextService(
+        db_manager=db,
+        today_fn=lambda: date(2026, 6, 6),
+    )
+
+    context = service.get_context(
+        region="cn",
+        config=SimpleNamespace(report_language="zh"),
+        notifier=MagicMock(),
+        analyzer=MagicMock(),
+        search_service=MagicMock(),
+        target_date=date(2026, 6, 6),
+        allow_generate=False,
+    )
+
+    assert context is None
+
+
+def test_does_not_reuse_history_from_adjacent_created_date_without_payload_date() -> None:
+    db = MagicMock()
+    db.get_analysis_history.return_value = [
+        _history_record(created_at=datetime(2026, 6, 7, 9, 30), query_id="other-run-q")
+    ]
+    service = DailyMarketContextService(
+        db_manager=db,
+        today_fn=lambda: date(2026, 6, 6),
+    )
+
+    context = service.get_context(
+        region="cn",
+        config=SimpleNamespace(report_language="zh"),
+        notifier=MagicMock(),
+        analyzer=MagicMock(),
+        search_service=MagicMock(),
+        target_date=date(2026, 6, 6),
+        allow_generate=False,
+    )
+
+    assert context is None
+
+
+def test_intraday_context_ttl_uses_local_database_clock() -> None:
+    real_datetime = datetime
+    fake_datetime = MagicMock(wraps=real_datetime)
+    fake_datetime.now.return_value = real_datetime(2026, 6, 8, 10, 16)
+
+    with patch.object(daily_market_context_module, "datetime", fake_datetime), patch.object(
+        daily_market_context_module,
+        "_is_intraday_market_open",
+        return_value=True,
+    ) as market_open:
+        fresh = daily_market_context_module._context_fresh_enough(
+            real_datetime(2026, 6, 8, 10, 0)
+        )
+
+    assert fresh is False
+    market_open.assert_called_once_with(now=None)
+
+
 def test_reuses_same_run_history_when_saved_under_different_wall_clock_date() -> None:
     db = MagicMock()
     db.get_analysis_history.return_value = [
