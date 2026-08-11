@@ -83,6 +83,9 @@ verify_*.py
 !.claude/skills/
 !.claude/skills/**
 
+# ignore Codex workspace artifacts (mirror agent for .claude/skills)
+.Codex/*
+
 # ignore static files
 static/
 /apps/dsa-desktop/dist/
