@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [文档] 部署指南（中英）补充云平台 IP 转发注意事项：Docker 容器出站依赖 `net.ipv4.ip_forward=1`，GCP 镜像的 `/etc/sysctl.d/60-gce-network-security.conf` 会在 sysctl 重载时将其重置为 0 导致容器全部外网请求失败（DNS/LLM/行情源），并给出检查与持久化修复命令
+
 - [新功能] 选股新增独立 `cn_etf` 市场池与三套 ETF 策略，使用交易所资格清单和境内指数主题分类，采用新浪快照、腾讯/新浪日线及独立缓存链路，并在 Web 展示 ETF 主题与市场池诊断
 
 - [新功能] Agent Chat 按会话持久化 Skill 选择，支持刷新和会话切换恢复，并区分省略 `skills`、显式空列表与非空选择；无持久化状态的历史会话继续使用运行时默认且不会被静默转为显式选择，复用分析 `context` 中残留的 legacy `skills` / `strategies` 也不会覆盖顶层三态或会话状态，非空但全部无效的 Skill 请求不会被当成显式空列表并清空既有选择

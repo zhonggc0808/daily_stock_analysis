@@ -42,6 +42,8 @@ cp .env.example .env
 vim .env  # 填入真实的 API Key 等配置
 ```
 
+Compose 启动时从仓库根目录 `.env` 注入环境变量；Web 设置页保存的运行时配置写入宿主机 `data/runtime.env`（容器内 `/app/data/runtime.env`），容器重建后仍会保留。启动环境中的同名变量优先级更高，因此需要持久修改这类变量时也应同步更新根目录 `.env`。
+
 ### 3. 一键启动
 
 ```bash
@@ -69,6 +71,31 @@ docker-compose -f ./docker/docker-compose.yml ps
 
 如果只能使用 `512M`，请避免同时启动 `server` 和 `analyzer`，并关闭非必要的大盘复盘、新闻扩展和图片报告能力。
 
+### 3.2 云平台 IP 转发注意事项（GCP 必读）
+
+Docker 容器访问外网依赖宿主机内核的 IP 转发（`net.ipv4.ip_forward=1`），Docker 守护进程启动时会自动开启。但 **Google Cloud（GCP）镜像自带的安全加固文件 `/etc/sysctl.d/60-gce-network-security.conf` 固定设置 `net.ipv4.ip_forward=0`**。之后若 `systemd-sysctl` 被重载（例如系统更新、`systemctl restart systemd-sysctl`）或 GCP Guest Agent 重新应用系统参数，`ip_forward` 会被改回 0，导致容器内所有出站请求失败。
+
+典型症状（容器内日志）：
+
+- 所有外部 API 报 `Temporary failure in name resolution`（DNS 解析失败）：行情源（东财/腾讯/新浪）、搜索（Tavily/SearXNG）、LLM 全部受影响
+- 分析任务在 LLM 调用处失败：`OpenAIException - Connection error`
+- Web 界面正常（入站/回环不受影响），但任何需要出站的环节都失败
+
+检查：
+
+```bash
+sysctl net.ipv4.ip_forward   # 必须输出 net.ipv4.ip_forward = 1
+```
+
+修复（立即生效 + 持久化覆盖）：
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-docker-forward.conf
+```
+
+`99-docker-forward.conf` 排序在 `60-gce-network-security.conf` 之后，`sysctl --system` 重载时以它为准，避免再次被改回。验证：执行 `sysctl --system` 后确认最终值仍为 1。
+
 ### 4. 常用管理命令
 
 ```bash
@@ -94,6 +121,7 @@ docker-compose -f ./docker/docker-compose.yml exec -u dsa stock-analyzer python 
 
 数据自动保存在宿主机目录：
 - `./data/` - 数据库文件
+- `./data/runtime.env` - Web 设置页保存的运行时配置
 - `./logs/` - 日志文件
 - `./reports/` - 分析报告
 

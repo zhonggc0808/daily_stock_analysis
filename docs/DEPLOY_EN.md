@@ -42,6 +42,8 @@ cp .env.example .env
 vim .env  # Fill in real API Keys and configuration
 ```
 
+Compose injects startup environment variables from the repository-root `.env`. Runtime settings saved from the Web UI are written to host file `data/runtime.env` (container path `/app/data/runtime.env`) and survive container recreation. Same-name variables injected at startup take precedence, so update the root `.env` as well when such a value must persist across restarts.
+
 ### 3. One-Click Start
 
 ```bash
@@ -64,6 +66,31 @@ The default `docker/docker-compose.yml` sets `limits.memory: 1G` and `reservatio
 - Heavy workloads: `2G+`, suitable when running `server + analyzer` together, multi-stock analysis, default `MAX_WORKERS=3`, market review, news expansion, image reports, or screening.
 
 If you can only use `512M`, avoid starting both `server` and `analyzer`, and disable non-essential market review, news expansion, and image report features.
+
+### 3.2 Cloud IP Forwarding Notes (Required for GCP)
+
+Docker containers need the host kernel's IP forwarding (`net.ipv4.ip_forward=1`) to reach the internet; the Docker daemon enables it automatically at startup. However, **Google Cloud (GCP) images ship a security hardening file `/etc/sysctl.d/60-gce-network-security.conf` that forces `net.ipv4.ip_forward=0`**. If `systemd-sysctl` is later reloaded (e.g. after a system update or `systemctl restart systemd-sysctl`) or the GCP Guest Agent re-applies system parameters, `ip_forward` is reset to 0 and **all outbound requests from containers fail**.
+
+Typical symptoms (in container logs):
+
+- All external APIs report `Temporary failure in name resolution` (DNS resolution failure): market data sources (Eastmoney/Tencent/Sina), search (Tavily/SearXNG), and the LLM are all affected
+- Analysis tasks fail at the LLM call with `OpenAIException - Connection error`
+- The web UI works fine (inbound/loopback is unaffected), but anything requiring outbound access fails
+
+Check:
+
+```bash
+sysctl net.ipv4.ip_forward   # must output net.ipv4.ip_forward = 1
+```
+
+Fix (immediate + persistent override):
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-docker-forward.conf
+```
+
+`99-docker-forward.conf` sorts after `60-gce-network-security.conf`, so a `sysctl --system` reload honors it and the value won't be flipped back. Verify by running `sysctl --system` and confirming the final value is still 1.
 
 ### 4. Common Management Commands
 
@@ -90,6 +117,7 @@ docker-compose -f ./docker/docker-compose.yml exec -u dsa stock-analyzer python 
 
 Data is automatically saved to host directories:
 - `./data/` - Database files
+- `./data/runtime.env` - Runtime settings saved from the Web UI
 - `./logs/` - Log files
 - `./reports/` - Analysis reports
 
