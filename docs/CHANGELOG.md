@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 选股任务支持在 Web 页面取消；服务端在各处理阶段协作式中断，并避免已取消任务继续保存结果
+
+- [修复] 选股日线补齐优先复用有效缓存，并在批量处理候选期间持续更新完成数量和进度，避免重复下载行情及页面长时间停在 42%
+
 - [文档] 部署指南（中英）补充云平台 IP 转发注意事项：Docker 容器出站依赖 `net.ipv4.ip_forward=1`，GCP 镜像的 `/etc/sysctl.d/60-gce-network-security.conf` 会在 sysctl 重载时将其重置为 0 导致容器全部外网请求失败（DNS/LLM/行情源），并给出检查与持久化修复命令
 
 - [修复] Docker Compose 恢复从仓库根目录 `.env` 启动，并将 Web 设置页配置持久化到 `data/runtime.env`，避免首次部署因缺失 `data/.env` 而失败

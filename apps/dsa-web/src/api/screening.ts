@@ -258,7 +258,7 @@ export type ScreeningScreenResponse = {
 export type ScreeningScreenAccepted = {
   taskId: string;
   traceId?: string | null;
-  status: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  status: 'pending' | 'processing' | 'cancel_requested' | 'cancelled' | 'completed' | 'failed' | string;
   message: string;
   strategy: string;
   market: string;
@@ -268,7 +268,7 @@ export type ScreeningScreenAccepted = {
 export type ScreeningScreenTaskStatus = {
   taskId: string;
   traceId?: string | null;
-  status: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  status: 'pending' | 'processing' | 'cancel_requested' | 'cancelled' | 'completed' | 'failed' | string;
   progress?: number | null;
   message?: string | null;
   error?: string | null;
@@ -455,6 +455,13 @@ export const screeningApi = {
 
   async getScreenTask(taskId: string): Promise<ScreeningScreenTaskStatus> {
     const response = await apiClient.get<Record<string, unknown>>(`/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}`);
+    return toCamelCase<ScreeningScreenTaskStatus>(response.data);
+  },
+
+  async cancelScreenTask(taskId: string): Promise<ScreeningScreenTaskStatus> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      `/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}/cancel`,
+    );
     return toCamelCase<ScreeningScreenTaskStatus>(response.data);
   },
 

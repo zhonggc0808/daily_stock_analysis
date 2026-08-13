@@ -10,6 +10,7 @@ const {
   getHotspots,
   getStrategies,
   getScreenTask,
+  cancelScreenTask,
   navigate,
   resetLastScreenResult,
   screenStocks,
@@ -40,6 +41,14 @@ const {
       result: lastScreenResult,
     };
   });
+  const cancelScreenTask = vi.fn(async (taskId: string) => ({
+    taskId,
+    traceId: taskId,
+    status: 'cancel_requested',
+    progress: 42,
+    message: '正在取消任务...',
+    result: null,
+  }));
   return {
     enableScreening: vi.fn(),
     getScreeningStatus: vi.fn(),
@@ -47,6 +56,7 @@ const {
     getHotspots: vi.fn(),
     getStrategies: vi.fn(),
     getScreenTask,
+    cancelScreenTask,
     navigate: vi.fn(),
     resetLastScreenResult: () => {
       lastScreenResult = null;
@@ -72,6 +82,7 @@ vi.mock('../../api/screening', () => ({
     getHotspots: (payload: unknown) => getHotspots(payload),
     getStrategies: () => getStrategies(),
     getScreenTask: (taskId: string) => getScreenTask(taskId),
+    cancelScreenTask: (taskId: string) => cancelScreenTask(taskId),
     screen: (payload: unknown) => screenStocks(payload),
     startScreen: (payload: unknown) => startScreenTask(payload),
   },
@@ -126,6 +137,7 @@ describe('StockScreeningPage', () => {
     getHotspots.mockReset();
     getStrategies.mockReset();
     getScreenTask.mockClear();
+    cancelScreenTask.mockClear();
     navigate.mockReset();
     resetLastScreenResult();
     screenStocks.mockReset();
@@ -1172,6 +1184,50 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('恢复后的候选')).toBeInTheDocument();
     expect(screen.getByText('选股完成')).toBeInTheDocument();
     expect(window.sessionStorage.getItem('dsa.screening.activeScreenTask.v1')).toBeNull();
+  });
+
+  it('cancels an in-flight screening task from the run button', async () => {
+    getScreeningStatus.mockResolvedValue({
+      enabled: true,
+      available: true,
+    });
+    startScreenTask.mockResolvedValueOnce({
+      taskId: 'screen-task-cancel',
+      traceId: 'screen-task-cancel',
+      status: 'pending',
+      message: '选股任务已提交',
+      strategy: 'dual_low',
+      market: 'cn',
+      maxResults: 3,
+    });
+    getScreenTask.mockResolvedValueOnce({
+      taskId: 'screen-task-cancel',
+      traceId: 'screen-task-cancel',
+      status: 'processing',
+      progress: 42,
+      message: '正在筛选候选',
+      result: null,
+    });
+    cancelScreenTask.mockResolvedValueOnce({
+      taskId: 'screen-task-cancel',
+      traceId: 'screen-task-cancel',
+      status: 'cancelled',
+      progress: 42,
+      message: '选股任务已取消',
+      result: null,
+    });
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+    const cancelButton = await screen.findByRole('button', { name: '取消选股' });
+    fireEvent.click(cancelButton);
+
+    await waitFor(() => expect(cancelScreenTask).toHaveBeenCalledWith('screen-task-cancel'));
+    expect(await screen.findByText('选股已取消')).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('dsa.screening.activeScreenTask.v1')).toBeNull();
+    expect(screen.getByRole('button', { name: /运行选股/ })).toBeEnabled();
   });
 
   it('keeps a restored screening task recoverable when status polling times out', async () => {

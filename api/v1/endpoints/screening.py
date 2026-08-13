@@ -73,6 +73,19 @@ def _screening_task_not_found(task_id: str) -> HTTPException:
     )
 
 
+def _screening_task_response(task: Any) -> ScreeningScreenTaskStatus:
+    result = task.result if task.status == QueueTaskStatus.COMPLETED and isinstance(task.result, dict) else None
+    return ScreeningScreenTaskStatus(
+        task_id=task.task_id,
+        trace_id=task.trace_id or task.task_id,
+        status=task.status.value if isinstance(task.status, QueueTaskStatus) else str(task.status),
+        progress=task.progress,
+        message=task.message,
+        error=task.error,
+        result=result,
+    )
+
+
 @router.get("/status")
 def screening_status(config: Config = Depends(get_config_dep)) -> Dict[str, Any]:
     return _service(config).status()
@@ -150,12 +163,17 @@ def screening_start_screen_task(
         def report_progress(progress: int, message: str) -> None:
             task_queue.update_task_progress(task_id, progress, message)
 
+        def check_cancelled() -> None:
+            if task_queue.is_cancellation_requested(task_id):
+                raise RuntimeError("选股任务已取消")
+
         result = _service(config, db_manager).screen(
             strategy=request.strategy,
             market=request.market,
             max_results=request.max_results,
             selection_seed=request.variant_seed,
             progress_callback=report_progress,
+            cancellation_check=check_cancelled,
         )
         task_queue.update_task_progress(
             task_id,
@@ -190,16 +208,20 @@ def screening_screen_task_status(task_id: str) -> ScreeningScreenTaskStatus:
     if task is None or task.report_type != "screening_screen":
         raise _screening_task_not_found(task_id)
 
-    result = task.result if task.status == QueueTaskStatus.COMPLETED and isinstance(task.result, dict) else None
-    return ScreeningScreenTaskStatus(
-        task_id=task.task_id,
-        trace_id=task.trace_id or task.task_id,
-        status=task.status.value if isinstance(task.status, QueueTaskStatus) else str(task.status),
-        progress=task.progress,
-        message=task.message,
-        error=task.error,
-        result=result,
-    )
+    return _screening_task_response(task)
+
+
+@router.post("/screen/tasks/{task_id}/cancel", response_model=ScreeningScreenTaskStatus)
+def screening_cancel_screen_task(task_id: str) -> ScreeningScreenTaskStatus:
+    task_queue = get_task_queue()
+    task = task_queue.get_task(task_id)
+    if task is None or task.report_type != "screening_screen":
+        raise _screening_task_not_found(task_id)
+
+    cancelled = task_queue.cancel_task(task_id, message="选股任务已取消")
+    if cancelled is None:
+        raise _screening_task_not_found(task_id)
+    return _screening_task_response(cancelled)
 
 
 @router.post("/screen")

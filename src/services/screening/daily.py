@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import hashlib
 import inspect
@@ -73,6 +73,7 @@ def enrich_daily_features(
     max_workers: int | None = None,
     history_fetcher: Callable[..., pd.DataFrame] | None = None,
     market: str = "cn",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
     """Attach daily technical features to the first ``max_rows`` candidates.
 
@@ -131,12 +132,35 @@ def enrich_daily_features(
             features["daily_quality_flags"] = "fetch_failed"
             return idx, features, f"{code}: {exc}", {"daily_quality_flags": "fetch_failed"}
 
-    if len(fetch_requests) <= 1:
+    total_requests = len(fetch_requests)
+    if total_requests <= 1:
         fetched_rows = [fetch_one(request) for request in fetch_requests]
+        if total_requests and progress_callback is not None:
+            progress_callback(1, total_requests)
     else:
-        worker_limit = min(_normalize_max_workers(max_workers), len(fetch_requests))
-        with ThreadPoolExecutor(max_workers=worker_limit) as executor:
-            fetched_rows = list(executor.map(fetch_one, fetch_requests))
+        worker_limit = min(_normalize_max_workers(max_workers), total_requests)
+        fetched_rows: list[tuple[object, dict[str, object], str | None, dict[str, object]] | None] = [
+            None
+        ] * total_requests
+        executor = ThreadPoolExecutor(max_workers=worker_limit)
+        futures = {}
+        try:
+            futures = {
+                executor.submit(fetch_one, request): position
+                for position, request in enumerate(fetch_requests)
+            }
+            for completed, future in enumerate(as_completed(futures), start=1):
+                fetched_rows[futures[future]] = future.result()
+                if progress_callback is not None:
+                    progress_callback(completed, total_requests)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+        fetched_rows = [row for row in fetched_rows if row is not None]
 
     for idx, features, error, metadata in fetched_rows:
         for flag in str(metadata.get("daily_quality_flags") or "").split(";"):

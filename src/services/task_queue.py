@@ -539,6 +539,47 @@ class AnalysisTaskQueue:
             task = self._tasks.get(task_id)
             return task.copy() if task else None
 
+    def is_cancellation_requested(self, task_id: str) -> bool:
+        """Return whether an in-flight task should stop at its next checkpoint."""
+        with self._data_lock:
+            task = self._tasks.get(task_id)
+            return bool(
+                task
+                and task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED)
+            )
+
+    def cancel_task(self, task_id: str, *, message: str = "任务已取消") -> Optional[TaskInfo]:
+        """Cancel a queued task or request cooperative cancellation of a running task.
+
+        Python threads cannot be terminated safely. A task that has already started
+        therefore moves to ``cancel_requested`` until its callable reaches a
+        cancellation checkpoint. Queued tasks are cancelled immediately when the
+        executor accepts the cancellation.
+        """
+        event_type: Optional[str] = None
+        with self._data_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                return task.copy()
+
+            future = self._futures.get(task_id)
+            cancelled_before_start = bool(future and future.cancel())
+            if cancelled_before_start:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+                task.message = message
+                event_type = "task_cancelled"
+            else:
+                task.status = TaskStatus.CANCEL_REQUESTED
+                task.message = "正在取消任务..."
+                event_type = "task_cancel_requested"
+            task_snapshot = task.copy()
+
+        self._broadcast_event(event_type, task_snapshot.to_dict())
+        return task_snapshot
+
     def append_task_flow_event(
         self,
         task_id: str,
@@ -814,6 +855,14 @@ class AnalysisTaskQueue:
             if not task:
                 return None
 
+            if task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED):
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+                task.message = "任务已取消"
+                task_snapshot = task.copy()
+                self._broadcast_event("task_cancelled", task_snapshot.to_dict())
+                return None
+
             trace_id = task.trace_id or task_id
             task.status = TaskStatus.PROCESSING
             task.started_at = datetime.now()
@@ -842,13 +891,28 @@ class AnalysisTaskQueue:
             with self._data_lock:
                 task = self._tasks.get(task_id)
                 if task:
-                    task.status = TaskStatus.COMPLETED
-                    task.progress = 100
-                    task.completed_at = datetime.now()
-                    task.result = result
-                    task.message = "任务执行完成"
+                    if task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED):
+                        task.status = TaskStatus.CANCELLED
+                        task.completed_at = datetime.now()
+                        task.result = None
+                        task.message = "任务已取消"
+                    else:
+                        task.status = TaskStatus.COMPLETED
+                        task.progress = 100
+                        task.completed_at = datetime.now()
+                        task.result = result
+                        task.message = "任务执行完成"
 
-            self._broadcast_event("task_completed", task.to_dict())
+                task_snapshot = task.copy() if task else None
+
+            if task_snapshot and task_snapshot.status == TaskStatus.CANCELLED:
+                self._broadcast_event("task_cancelled", task_snapshot.to_dict())
+                logger.info(f"[TaskQueue] 自定义任务已取消: {task_id}")
+                self._cleanup_old_tasks()
+                return None
+
+            if task_snapshot:
+                self._broadcast_event("task_completed", task_snapshot.to_dict())
             logger.info(f"[TaskQueue] 自定义任务完成: {task_id}")
 
             self._cleanup_old_tasks()
@@ -863,13 +927,28 @@ class AnalysisTaskQueue:
             with self._data_lock:
                 task = self._tasks.get(task_id)
                 if task:
-                    task.status = TaskStatus.FAILED
-                    task.completed_at = datetime.now()
-                    task.error = error_msg[:200]
-                    task.message = f"任务失败: {error_msg[:80]}"
+                    if task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED):
+                        task.status = TaskStatus.CANCELLED
+                        task.completed_at = datetime.now()
+                        task.error = None
+                        task.message = "任务已取消"
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now()
+                        task.error = error_msg[:200]
+                        task.message = f"任务失败: {error_msg[:80]}"
 
-            if task:
-                self._broadcast_event("task_failed", task.to_dict())
+                    task_snapshot = task.copy()
+                else:
+                    task_snapshot = None
+
+            if task_snapshot:
+                event_type = (
+                    "task_cancelled"
+                    if task_snapshot.status == TaskStatus.CANCELLED
+                    else "task_failed"
+                )
+                self._broadcast_event(event_type, task_snapshot.to_dict())
 
             self._cleanup_old_tasks()
             return None

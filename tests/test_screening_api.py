@@ -2381,6 +2381,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             max_results=3,
             selection_seed="",
             progress_callback=ANY,
+            cancellation_check=ANY,
         )
         screen_mock.call_args.kwargs["progress_callback"](66, "正在执行 LLM 候选重排")
         self.assertEqual(result["candidate_count"], 0)
@@ -2394,6 +2395,34 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             66,
             "正在执行 LLM 候选重排",
         )
+
+    def test_cancel_screen_task_requests_queue_cancellation(self) -> None:
+        task = TaskInfo(
+            task_id="screen-task-1",
+            trace_id="screen-task-1",
+            stock_code="screening_screen",
+            status=QueueTaskStatus.PROCESSING,
+            progress=42,
+            message="正在执行选股",
+            report_type="screening_screen",
+        )
+        cancelled = task.copy()
+        cancelled.status = QueueTaskStatus.CANCEL_REQUESTED
+        cancelled.message = "正在取消任务..."
+        fake_queue = MagicMock()
+        fake_queue.get_task.return_value = task
+        fake_queue.cancel_task.return_value = cancelled
+
+        with patch("api.v1.endpoints.screening.get_task_queue", return_value=fake_queue):
+            response = screening_endpoint.screening_cancel_screen_task("screen-task-1")
+
+        fake_queue.cancel_task.assert_called_once_with(
+            "screen-task-1",
+            message="选股任务已取消",
+        )
+        self.assertEqual(response.status, "cancel_requested")
+        self.assertEqual(response.progress, 42)
+        self.assertIsNone(response.result)
 
     def test_screen_task_status_returns_screening_result(self) -> None:
         task = TaskInfo(
@@ -2500,6 +2529,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             selection_seed="browser-a",
             config=ANY,
             progress_callback=None,
+            cancellation_check=None,
             daily_history_fetcher=ANY,
         )
         self.assertEqual(fake_module.screen.call_args.kwargs["context"]["llm"]["model"], "")
@@ -3388,6 +3418,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         with (
             patch.object(daily_module, "fetch_daily_history", new=fallback_fetch),
             patch("src.services.screening_service.get_dsa_daily_history", side_effect=RuntimeError("dsa unavailable")),
+            patch.object(daily_module, "_read_daily_history_cache", return_value=None),
         ):
             daily_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
             self.assertIsNotNone(daily_fetcher)
@@ -3560,6 +3591,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
                 ),
             ),
             patch.object(daily_module, "_daily_history_cache_path", return_value=cache_path) as cache_path_mock,
+            patch.object(daily_module, "_read_daily_history_cache", return_value=None),
             patch.object(daily_module, "_write_daily_history_cache") as cache_write_mock,
         ):
             daily_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
@@ -3588,6 +3620,40 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(cache_write_mock.call_args.kwargs["code"], "000001")
         self.assertEqual(cache_write_mock.call_args.kwargs["source"], "auto")
         self.assertEqual(cache_write_mock.call_args.kwargs["lookback_days"], 90)
+
+    def test_dsa_daily_history_bridge_returns_fresh_cache_before_network(self) -> None:
+        import src.services.screening.daily as daily_module
+
+        cache_dir = Path("data/screening/daily_history")
+        cache_path = cache_dir / "000001.tencent.120.json"
+        cached = pd.DataFrame([{"date": "2026-08-13", "close": 10.5}])
+        cached.attrs["daily_source"] = "dsa:AkshareFetcher"
+
+        with (
+            patch.object(
+                daily_module,
+                "fetch_daily_history",
+                new=MagicMock(side_effect=AssertionError("Screening fallback should not run")),
+            ),
+            patch("src.services.screening_service.get_dsa_daily_history") as dsa_fetch,
+            patch.object(daily_module, "_daily_history_cache_path", return_value=cache_path),
+            patch.object(daily_module, "_read_daily_history_cache", return_value=cached) as cache_read,
+            patch.object(daily_module, "_write_daily_history_cache") as cache_write,
+        ):
+            daily_fetcher = screening_service._build_screening_dsa_daily_history_fetcher()
+            self.assertIsNotNone(daily_fetcher)
+            result = daily_fetcher(
+                "1",
+                lookback_days=120,
+                source="tencent",
+                cache_dir=cache_dir,
+                cache_ttl_seconds=3600.0,
+            )
+
+        self.assertIs(result, cached)
+        cache_read.assert_called_once_with(cache_path, ttl_seconds=3600.0)
+        dsa_fetch.assert_not_called()
+        cache_write.assert_not_called()
 
     def test_screen_preserves_explicit_openai_base_url_without_openai_channel(self) -> None:
         config = Config(
@@ -3925,6 +3991,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             selection_seed="",
             config=ANY,
             progress_callback=None,
+            cancellation_check=None,
             daily_history_fetcher=ANY,
         )
         self.assertEqual(payload["candidates"], [])

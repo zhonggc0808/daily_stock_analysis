@@ -396,4 +396,25 @@ describe('screeningApi', () => {
     expect(result.result?.dailyEnrichCount).toBe(4);
     expect(result.result?.postAnalyzers).toEqual(['scorecard']);
   });
+
+  it('cancels an async screening task', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        task_id: 'screen-task-1',
+        trace_id: 'screen-task-1',
+        status: 'cancel_requested',
+        progress: 42,
+        message: '正在取消任务...',
+      },
+    });
+
+    const result = await screeningApi.cancelScreenTask('screen-task-1');
+
+    expect(post).toHaveBeenCalledWith('/api/v1/screening/screen/tasks/screen-task-1/cancel');
+    expect(result).toMatchObject({
+      taskId: 'screen-task-1',
+      status: 'cancel_requested',
+      progress: 42,
+    });
+  });
 });

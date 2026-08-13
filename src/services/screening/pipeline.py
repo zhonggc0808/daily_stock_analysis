@@ -70,6 +70,7 @@ def screen(
     context: dict[str, object] | None = None,
     config: Config | None = None,
     progress_callback: Callable[[int, str], None] | None = None,
+    cancellation_check: Callable[[], None] | None = None,
     daily_history_fetcher: Callable[..., pd.DataFrame] | None = None,
 ) -> ScreenResult:
     """Execute stock screening with the given strategy.
@@ -106,6 +107,7 @@ def screen(
     Returns:
         ScreenResult with ranked picks.
     """
+    _check_cancelled(cancellation_check)
     if config is None:
         config = Config.from_env()
 
@@ -161,6 +163,7 @@ def screen(
         cache_ttl_seconds=config.snapshot_cache_ttl_seconds,
         market=market,
     )
+    _check_cancelled(cancellation_check)
     effective_industry_map_files = (
         list(industry_map_files)
         if industry_map_files is not None
@@ -221,6 +224,7 @@ def screen(
         42,
         f"快照筛选完成，保留 {after_filter_count} 条候选",
     )
+    _check_cancelled(cancellation_check)
 
     if df.empty:
         return ScreenResult(
@@ -255,6 +259,21 @@ def screen(
         enrich_count = min(daily_limit, len(provisional))
         daily_candidates = provisional.head(enrich_count)
         try:
+            _emit_progress(
+                progress_callback,
+                43,
+                f"正在补齐候选历史行情（0/{enrich_count}）",
+            )
+
+            def report_daily_progress(completed: int, total: int) -> None:
+                _check_cancelled(cancellation_check)
+                progress = 43 + min(8, int(completed * 8 / max(total, 1)))
+                _emit_progress(
+                    progress_callback,
+                    progress,
+                    f"正在补齐候选历史行情（{completed}/{total}）",
+                )
+
             enriched = enrich_daily_features(
                 daily_candidates,
                 max_rows=enrich_count,
@@ -266,7 +285,9 @@ def screen(
                 max_workers=config.daily_fetch_max_workers,
                 history_fetcher=daily_history_fetcher,
                 market=profile.daily_market,
+                progress_callback=report_daily_progress,
             )
+            _check_cancelled(cancellation_check)
             daily_enriched = True
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]
             daily_enrich_count = int(enriched.attrs.get("daily_success_count", len(enriched)))
@@ -376,8 +397,10 @@ def screen(
     # 6.5. Host-provided candidate context, e.g. DSA realtime quote,
     # fundamentals, and news. This runs before LLM ranking so L2 can use it.
     _emit_progress(progress_callback, 52, "正在补充候选行情与基本面")
+    _check_cancelled(cancellation_check)
     if profile.collect_company_context:
         degradation.extend(apply_dsa_provider_context(picks, context))
+    _check_cancelled(cancellation_check)
     llm_fallback_picks = [copy.deepcopy(pick) for pick in picks]
 
     # 7. L2 LLM ranking
@@ -392,6 +415,7 @@ def screen(
     llm_failure_reason = ""
     if use_llm and config.has_llm_config():
         _emit_progress(progress_callback, 66, "正在执行 LLM 候选重排")
+        _check_cancelled(cancellation_check)
         candidate_context_rows: list[dict[str, object]] = []
         event_source_weights = _event_source_weights(screening.event_profile)
         should_collect_candidate_context = (
@@ -466,6 +490,7 @@ def screen(
             max_tokens=config.llm_max_tokens,
             degradation=llm_prompt_degradation,
         )
+        _check_cancelled(cancellation_check)
         degradation.extend(llm_prompt_degradation)
         picks = llm_result.picks
         llm_market_view = llm_result.market_view
@@ -517,6 +542,7 @@ def screen(
     # 11. Optional L3 post-analysis, DSA is only one possible analyzer.
     if analyzer_names:
         _emit_progress(progress_callback, 82, "正在执行最终评分与风险校验")
+        _check_cancelled(cancellation_check)
         # The local scorecard covers the complete shortlist. Remote analyzers
         # retain their configured operational cap; the variant stage below
         # admits only candidates that completed every configured analyzer.
@@ -547,6 +573,7 @@ def screen(
             max_picks=post_max_picks,
             scorecard_profile=screening.scorecard_profile,
         )
+        _check_cancelled(cancellation_check)
         degradation.extend(post_degradation)
 
     # Apply selection variant after post-analyzers to ensure rotation respects
@@ -627,6 +654,11 @@ def _emit_progress(
         callback(progress, message)
     except Exception as exc:  # noqa: BLE001 - progress reporting must not fail screening.
         logger.debug("Screening progress callback failed: %s", exc)
+
+
+def _check_cancelled(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def _df_to_picks(df: pd.DataFrame) -> list[Pick]:

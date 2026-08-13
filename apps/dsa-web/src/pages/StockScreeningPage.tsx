@@ -21,6 +21,7 @@ import {
   Search,
   Shield,
   SlidersHorizontal,
+  Square,
   Stethoscope,
   Trees,
   Utensils,
@@ -518,7 +519,9 @@ const getScreenMessages = (meta: ScreeningScreenResponse | null) => {
   return messages;
 };
 
-const isRunningScreenTask = (status: string | undefined | null) => status === 'pending' || status === 'processing';
+const isRunningScreenTask = (status: string | undefined | null) => (
+  status === 'pending' || status === 'processing' || status === 'cancel_requested'
+);
 
 const formatScreenTaskFailure = (value: string | null | undefined) => {
   const text = String(value || '').trim();
@@ -917,6 +920,8 @@ const StockScreeningPage: React.FC = () => {
   const [screenMeta, setScreenMeta] = useState<ScreeningScreenResponse | null>(null);
   const [expandedCode, setExpandedCode] = useState<string | null>(null);
   const [loading, setLoading] = useState(Boolean(restoredTask?.taskId));
+  const [cancelling, setCancelling] = useState(false);
+  const [taskCancelled, setTaskCancelled] = useState(false);
   const [enabling, setEnabling] = useState(false);
   const [loadingStrategies, setLoadingStrategies] = useState(false);
   const [error, setError] = useState('');
@@ -1238,7 +1243,17 @@ const StockScreeningPage: React.FC = () => {
         return;
       }
 
+      if (task.status === 'cancelled') {
+        setTaskCancelled(true);
+        setCancelling(false);
+        setTaskMessage(task.message || '选股任务已取消');
+        setError('');
+        finishTask();
+        return;
+      }
+
       if (isRunningScreenTask(task.status)) {
+        setCancelling(task.status === 'cancel_requested');
         setLoading(true);
         timer = window.setTimeout(pollTask, SCREEN_TASK_POLL_INTERVAL_MS);
         return;
@@ -1355,6 +1370,8 @@ const StockScreeningPage: React.FC = () => {
 
   const handleSubmit = async () => {
     setLoading(true);
+    setCancelling(false);
+    setTaskCancelled(false);
     setError('');
     setScreenMeta(null);
     setTaskProgress(0);
@@ -1376,6 +1393,29 @@ const StockScreeningPage: React.FC = () => {
       setCandidates([]);
       setLoading(false);
       setError(toApiErrorMessage(err, '选股任务提交失败，请稍后重试。'));
+    }
+  };
+
+  const handleCancel = async () => {
+    if (!activeTaskId || cancelling) {
+      return;
+    }
+    setCancelling(true);
+    setError('');
+    setTaskMessage('正在取消选股任务...');
+    try {
+      const task = await screeningApi.cancelScreenTask(activeTaskId);
+      if (task.status === 'cancelled') {
+        clearPersistedScreenTask();
+        setActiveTaskId(null);
+        setLoading(false);
+        setTaskCancelled(true);
+        setTaskMessage(task.message || '选股任务已取消');
+        setCancelling(false);
+      }
+    } catch (err) {
+      setCancelling(false);
+      setError(toApiErrorMessage(err, '取消选股失败，请稍后重试。'));
     }
   };
 
@@ -1743,16 +1783,28 @@ const StockScreeningPage: React.FC = () => {
             />
           </label>
 
-          <Button
-            className="h-11 min-w-40"
-            isLoading={loading}
-            loadingText="筛选中..."
-            disabled={!isScreeningEnabled || loading || !strategy.trim()}
-            onClick={() => void handleSubmit()}
-          >
-            <Play className="h-4 w-4" />
-            运行选股
-          </Button>
+          {loading && activeTaskId ? (
+            <Button
+              className="h-11 min-w-40"
+              variant="danger-subtle"
+              disabled={cancelling}
+              onClick={() => void handleCancel()}
+            >
+              <Square className="h-4 w-4" />
+              {cancelling ? '取消中...' : '取消选股'}
+            </Button>
+          ) : (
+            <Button
+              className="h-11 min-w-40"
+              isLoading={loading}
+              loadingText="筛选中..."
+              disabled={!isScreeningEnabled || loading || !strategy.trim()}
+              onClick={() => void handleSubmit()}
+            >
+              <Play className="h-4 w-4" />
+              运行选股
+            </Button>
+          )}
         </div>
 
         <div className="mt-3 rounded-xl border border-border/75 bg-surface/55 px-3 py-2 text-xs leading-5 text-secondary-text">
@@ -1762,19 +1814,23 @@ const StockScreeningPage: React.FC = () => {
         </div>
       </section>
 
-      {loading || screenMeta ? (
+      {loading || screenMeta || taskCancelled ? (
         <section className="rounded-2xl border border-border bg-card/95 p-4 shadow-soft-card">
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-3">
-              <span className={`grid h-7 w-7 place-items-center rounded-full ${loading ? 'text-cyan' : 'text-success'}`}>
-                {loading ? <CircleAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />}
+              <span className={`grid h-7 w-7 place-items-center rounded-full ${loading ? 'text-cyan' : taskCancelled ? 'text-secondary-text' : 'text-success'}`}>
+                {loading ? <CircleAlert className="h-5 w-5" /> : taskCancelled ? <Square className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />}
               </span>
               <div>
-                <h2 className="text-sm font-semibold text-foreground">{loading ? '选股运行中' : '选股完成'}</h2>
+                <h2 className="text-sm font-semibold text-foreground">
+                  {loading ? (cancelling ? '正在取消选股' : '选股运行中') : taskCancelled ? '选股已取消' : '选股完成'}
+                </h2>
                 <p className="mt-1 text-xs text-secondary-text">
                   {loading
                     ? `${taskMessage || '正在执行选股'} · ${taskProgress}%`
-                    : `${displayedStrategy} · ${MARKETS.find((item) => item.id === market)?.label}`}
+                    : taskCancelled
+                      ? taskMessage || '选股任务已取消'
+                      : `${displayedStrategy} · ${MARKETS.find((item) => item.id === market)?.label}`}
                 </p>
               </div>
             </div>

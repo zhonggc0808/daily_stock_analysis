@@ -1216,7 +1216,9 @@ class ScreeningService:
         max_results: int,
         selection_seed: str = "",
         progress_callback: Callable[[int, str], None] | None = None,
+        cancellation_check: Callable[[], None] | None = None,
     ) -> Dict[str, Any]:
+        _check_screening_cancelled(cancellation_check)
         _ensure_screening_enabled(self.config)
         _ensure_screening_available_for_use()
         _ensure_supported_market(market)
@@ -1230,6 +1232,7 @@ class ScreeningService:
                 self.config,
                 selection_seed=selection_seed,
                 progress_callback=progress_callback,
+                cancellation_check=cancellation_check,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -1249,6 +1252,7 @@ class ScreeningService:
                 detail={"error": "screening_screen_failed", "message": f"Screening 选股运行失败：{exc}"},
             ) from exc
 
+        _check_screening_cancelled(cancellation_check)
         raw_data = _to_plain(raw)
         if not isinstance(raw_data, dict):
             raw_data = {"candidates": raw_data}
@@ -1269,7 +1273,9 @@ class ScreeningService:
                 92,
                 "正在补充入选股票的新闻与事件",
             )
+            _check_screening_cancelled(cancellation_check)
             selected, dsa_enrichment = _enrich_candidates_with_dsa(selected)
+            _check_screening_cancelled(cancellation_check)
         warnings = _collect_screening_warning_messages(raw_data)
         response = {
             "enabled": True,
@@ -1313,6 +1319,7 @@ class ScreeningService:
             "result_variant_rotated_slots": raw_data.get("result_variant_rotated_slots") or 0,
         }
         if self.db_manager is not None:
+            _check_screening_cancelled(cancellation_check)
             self.db_manager.save_screening_run(response)
         return response
 
@@ -1328,6 +1335,11 @@ def _emit_screening_progress(
         callback(progress, message)
     except Exception as exc:  # noqa: BLE001 - progress reporting must not fail screening.
         logger.debug("Screening service progress callback failed: %s", exc)
+
+
+def _check_screening_cancelled(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def _normalize_screening_hotspot_detail(detail: Any, *, provider: str, requested_topic: str) -> Dict[str, Any]:
@@ -1747,6 +1759,7 @@ def _call_screening_screen(
     *,
     selection_seed: str = "",
     progress_callback: Callable[[int, str], None] | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> Any:
     # Environment bridging is process-global, so keep it brief: materialize an
     # immutable pipeline config while holding the lock, then release it before
@@ -1766,6 +1779,7 @@ def _call_screening_screen(
             context=pipeline_context,
             config=pipeline_config,
             progress_callback=progress_callback,
+            cancellation_check=cancellation_check,
             daily_history_fetcher=daily_history_fetcher,
         )
 
@@ -1828,15 +1842,31 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
                 market=market,
             )
 
+        normalized_code = code
+        normalize_code = getattr(daily_module, "_normalize_daily_code", None)
+        if callable(normalize_code):
+            normalized_code = normalize_code(code)
+
+        cache_path = None
+        if cache_dir is not None:
+            cache_path_builder = getattr(daily_module, "_daily_history_cache_path", None)
+            cache_reader = getattr(daily_module, "_read_daily_history_cache", None)
+            if callable(cache_path_builder) and callable(cache_reader):
+                cache_path = cache_path_builder(
+                    cache_dir,
+                    code=normalized_code,
+                    source=source,
+                    lookback_days=int(lookback_days),
+                )
+                cached = cache_reader(cache_path, ttl_seconds=cache_ttl_seconds)
+                if cached is not None:
+                    return cached
+
         try:
             dsa_df, dsa_source = get_dsa_daily_history(code, lookback_days=lookback_days)
             normalized = _normalize_dsa_daily_history(dsa_df)
             if normalized is not None and not normalized.empty:
                 resolved_source = f"dsa:{dsa_source}"
-                normalized_code = code
-                normalize_code = getattr(daily_module, "_normalize_daily_code", None)
-                if callable(normalize_code):
-                    normalized_code = normalize_code(code)
                 normalized.attrs["source"] = resolved_source
                 normalized.attrs["daily_source"] = resolved_source
                 normalized.attrs["daily_requested_source"] = source
@@ -1844,16 +1874,9 @@ def _build_screening_dsa_daily_history_fetcher() -> Optional[Callable[..., Any]]
                 normalized.attrs["daily_source_order_notes"] = []
                 normalized.attrs["source_errors"] = []
                 normalized.attrs["daily_source_health"] = {}
-                if cache_dir is not None:
-                    cache_path_builder = getattr(daily_module, "_daily_history_cache_path", None)
+                if cache_path is not None:
                     cache_writer = getattr(daily_module, "_write_daily_history_cache", None)
-                    if callable(cache_path_builder) and callable(cache_writer):
-                        cache_path = cache_path_builder(
-                            cache_dir,
-                            code=normalized_code,
-                            source=source,
-                            lookback_days=int(lookback_days),
-                        )
+                    if callable(cache_writer):
                         cache_writer(
                             cache_path,
                             normalized,

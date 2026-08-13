@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
@@ -16,6 +17,7 @@ from src.services.screening import REFERENCE_REVISION
 from src.services.screening import dsa as screening_dsa
 from src.services.screening.dsa_provider import apply_dsa_provider_context
 from src.services.screening import pipeline as screening_pipeline
+from src.services.screening import daily as screening_daily
 from src.services.screening import post_analysis as screening_post_analysis
 from src.services.screening.filter import apply_hard_filters
 from src.services.screening.config import Config as ScreeningRuntimeConfig
@@ -165,9 +167,11 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
         portfolio_diversity_enabled=False,
     )
     captured: dict[str, object] = {}
+    progress_updates: list[tuple[int, str]] = []
 
     def fake_enrich_daily_features(df: pd.DataFrame, **kwargs):
         captured.update(kwargs)
+        kwargs["progress_callback"](1, len(df))
         enriched = df.copy()
         enriched["daily_source"] = "cache"
         enriched.attrs["daily_errors"] = []
@@ -198,12 +202,58 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
         use_llm=False,
         config=config,
         daily_history_fetcher=history_fetcher,
+        progress_callback=lambda progress, message: progress_updates.append((progress, message)),
     )
 
     assert captured["cache_dir"] == Path("/tmp/daily-history-cache")
     assert captured["cache_ttl_seconds"] == 6 * 60 * 60
     assert captured["history_fetcher"] is history_fetcher
+    assert (43, "正在补齐候选历史行情（0/1）") in progress_updates
+    assert (51, "正在补齐候选历史行情（1/1）") in progress_updates
     assert result.daily_enriched is True
+
+
+def test_daily_enrichment_reports_completion_order_and_preserves_row_order(monkeypatch) -> None:
+    rows = pd.DataFrame(
+        [
+            {"code": "000001", "name": "slow"},
+            {"code": "000002", "name": "fast"},
+        ],
+        index=[10, 20],
+    )
+    release_slow = threading.Event()
+    fast_finished = threading.Event()
+
+    def fetch_history(code: str, **_kwargs):
+        if code == "000001":
+            assert release_slow.wait(timeout=2)
+        else:
+            fast_finished.set()
+            release_slow.set()
+        frame = pd.DataFrame(
+            [{"date": "2026-08-13", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 100}]
+        )
+        frame.attrs["daily_source"] = code
+        return frame
+
+    monkeypatch.setattr(
+        screening_daily,
+        "compute_daily_features",
+        lambda hist: {"daily_data_points": 1, "signal_score": float(hist.attrs["daily_source"][-1])},
+    )
+    progress: list[tuple[int, int]] = []
+
+    enriched = screening_daily.enrich_daily_features(
+        rows,
+        max_workers=2,
+        history_fetcher=fetch_history,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert fast_finished.is_set()
+    assert progress == [(1, 2), (2, 2)]
+    assert list(enriched.index) == [10, 20]
+    assert list(enriched["daily_source"]) == ["000001", "000002"]
 
 
 def test_dsa_post_analyzer_records_attempted_and_capped_statuses(monkeypatch) -> None:
