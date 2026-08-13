@@ -12,11 +12,13 @@ A股自选股智能分析系统 - 搜索服务模块
 """
 
 import logging
+import contextvars
 import multiprocessing
 import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -44,6 +46,7 @@ from src.data.stock_mapping import (
     foreign_stock_english_aliases,
 )
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
+from src.services.external_io_limiter import external_io_slot
 
 logger = logging.getLogger(__name__)
 
@@ -2259,6 +2262,10 @@ class SearchService:
     _DIRECT_NEWS_CATEGORY = "direct_company_news"
     _SECTOR_NEWS_CATEGORY = "sector_related_news"
     _MACRO_NEWS_CATEGORY = "macro_market_news"
+    _intel_cache_lock = threading.RLock()
+    _intel_cache: Dict[str, Tuple[float, Dict[str, SearchResponse]]] = {}
+    _provider_cooldown_lock = threading.RLock()
+    _provider_cooldowns: Dict[str, float] = {}
     _NEWS_CATEGORY_PRIORITY = {
         _DIRECT_NEWS_CATEGORY: 0,
         _SECTOR_NEWS_CATEGORY: 1,
@@ -2392,6 +2399,9 @@ class SearchService:
         searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
+        news_intel_cache_ttl_seconds: int = 300,
+        search_provider_cooldown_seconds: int = 1800,
+        news_search_max_concurrency: int = 3,
     ):
         """
         初始化搜索服务
@@ -2419,9 +2429,15 @@ class SearchService:
             "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
+            "news_intel_cache_ttl_seconds": int(news_intel_cache_ttl_seconds),
+            "search_provider_cooldown_seconds": int(search_provider_cooldown_seconds),
+            "news_search_max_concurrency": int(news_search_max_concurrency),
         }
         self._providers: List[BaseSearchProvider] = []
         self.news_max_age_days = max(1, news_max_age_days)
+        self.news_intel_cache_ttl_seconds = max(0, int(news_intel_cache_ttl_seconds))
+        self.search_provider_cooldown_seconds = max(0, int(search_provider_cooldown_seconds))
+        self.news_search_max_concurrency = max(1, int(news_search_max_concurrency))
         raw_profile = (news_strategy_profile or "short").strip().lower()
         self.news_strategy_profile = normalize_news_strategy_profile(news_strategy_profile)
         if raw_profile != self.news_strategy_profile:
@@ -4351,7 +4367,8 @@ class SearchService:
         self,
         stock_code: str,
         stock_name: str,
-        max_searches: int = 3
+        max_searches: int = 3,
+        force_refresh: bool = False,
     ) -> Dict[str, SearchResponse]:
         """
         多维度情报搜索（同时使用多个引擎、多个维度）
@@ -4369,9 +4386,6 @@ class SearchService:
         Returns:
             {维度名称: SearchResponse} 字典
         """
-        results = {}
-        search_count = 0
-
         is_foreign = self._is_foreign_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
@@ -4491,6 +4505,23 @@ class SearchService:
         search_days = self._effective_news_window_days()
         target_per_dimension = 3
         provider_max_results = self._provider_request_size(target_per_dimension)
+        selected_dimensions = search_dimensions[:max(0, int(max_searches))]
+        cache_key = "|".join(
+            (
+                str(stock_code).strip().upper(),
+                str(stock_name).strip(),
+                str(search_days),
+                str(max_searches),
+                self.news_strategy_profile,
+            )
+        )
+        now_ts = time.time()
+        if self.news_intel_cache_ttl_seconds > 0 and not force_refresh:
+            with self._intel_cache_lock:
+                cached = self._intel_cache.get(cache_key)
+                if cached and now_ts - cached[0] <= self.news_intel_cache_ttl_seconds:
+                    logger.info("[情报缓存] %s(%s) 命中", stock_name, stock_code)
+                    return dict(cached[1])
 
         logger.info(
             (
@@ -4506,53 +4537,79 @@ class SearchService:
             provider_max_results,
         )
         
-        # 轮流使用不同的搜索引擎
-        provider_index = 0
-        
-        for dim in search_dimensions:
-            if search_count >= max_searches:
-                break
-            
-            # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
-            if not available_providers:
-                break
-            
-            provider = available_providers[provider_index % len(available_providers)]
-            provider_index += 1
-            
+        def provider_is_healthy(provider: BaseSearchProvider) -> bool:
+            with self._provider_cooldown_lock:
+                until = self._provider_cooldowns.get(provider.name, 0.0)
+                if until > time.time():
+                    logger.info("[搜索源冷却] 跳过 %s，剩余 %.0fs", provider.name, until - time.time())
+                    return False
+                self._provider_cooldowns.pop(provider.name, None)
+            return bool(provider.is_available)
+
+        def should_cooldown(response: SearchResponse) -> bool:
+            message = (response.error_message or "").lower()
+            return any(token in message for token in ("403", "418", "429", "too many requests"))
+
+        def search_dimension(index: int, dim: Dict[str, Any]) -> SearchResponse:
             request_days = (
                 self.ANALYTICAL_INTEL_LOOKBACK_DAYS
                 if dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS
                 else search_days
             )
-
-            logger.info(
-                "[情报搜索] %s: 使用 %s，请求窗口: 近%s天",
-                dim['desc'],
-                provider.name,
-                request_days,
+            available = [provider for provider in self._providers if provider_is_healthy(provider)]
+            if available:
+                offset = index % len(available)
+                available = available[offset:] + available[:offset]
+            response = SearchResponse(
+                query=dim['query'], results=[], provider="None", success=False,
+                error_message="没有健康的搜索源",
             )
+            provider_name = "None"
+            for provider_index, provider in enumerate(available):
+                provider_name = provider.name
+                logger.info(
+                    "[情报搜索] %s: 使用 %s，请求窗口: 近%s天",
+                    dim['desc'], provider.name, request_days,
+                )
+                try:
+                    with external_io_slot():
+                        if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+                            response = provider.search(
+                                dim['query'], max_results=provider_max_results,
+                                days=request_days, topic=dim['tavily_topic'],
+                            )
+                        else:
+                            response = provider.search(
+                                dim['query'], max_results=provider_max_results, days=request_days,
+                            )
+                except Exception as exc:
+                    response = SearchResponse(
+                        query=dim['query'], results=[], provider=provider.name,
+                        success=False, error_message=str(exc),
+                    )
+                if should_cooldown(response):
+                    with self._provider_cooldown_lock:
+                        self._provider_cooldowns[provider.name] = (
+                            time.time() + self.search_provider_cooldown_seconds
+                        )
+                    logger.warning(
+                        "[搜索源冷却] %s 返回限流/拒绝，冷却 %ss 并切换下一个搜索源",
+                        provider.name, self.search_provider_cooldown_seconds,
+                    )
+                if response.success:
+                    break
+                if provider_index + 1 < len(available):
+                    logger.info(
+                        "[搜索源切换] %s: %s -> %s",
+                        dim['desc'], provider.name, available[provider_index + 1].name,
+                    )
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                    topic=dim['tavily_topic'],
-                )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                )
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    log_scope=f"{stock_code}:{provider_name}:{dim['name']}",
                 )
             elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
                 filtered_response = self._filter_news_response(
@@ -4560,7 +4617,7 @@ class SearchService:
                     search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
                     max_results=provider_max_results,
                     keep_unknown=True,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    log_scope=f"{stock_code}:{provider_name}:{dim['name']}",
                 )
             else:
                 filtered_response = self._normalize_and_limit_response(
@@ -4573,19 +4630,16 @@ class SearchService:
                 stock_name=stock_name,
                 prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
                 max_results=provider_max_results,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
+                log_scope=f"{stock_code}:{provider_name}:{dim['name']}:rank",
             )
             filtered_response = self._filter_ranked_news_for_context(
                 filtered_response,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
+                log_scope=f"{stock_code}:{provider_name}:{dim['name']}:admission",
             )
             filtered_response = self._limit_search_response(
                 filtered_response,
                 max_results=target_per_dimension,
             )
-            results[dim['name']] = filtered_response
-            search_count += 1
-            
             if response.success:
                 logger.info(
                     "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
@@ -4595,10 +4649,42 @@ class SearchService:
                 )
             else:
                 logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
-            
-            # 短暂延迟避免请求过快
-            time.sleep(0.5)
-        
+            return filtered_response
+
+        unordered_results: Dict[str, SearchResponse] = {}
+        worker_count = min(self.news_search_max_concurrency, len(selected_dimensions))
+        if worker_count > 0:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="news-intel") as executor:
+                future_map = {
+                    executor.submit(
+                        contextvars.copy_context().run,
+                        search_dimension,
+                        index,
+                        dim,
+                    ): dim['name']
+                    for index, dim in enumerate(selected_dimensions)
+                }
+                for future in as_completed(future_map):
+                    dim_name = future_map[future]
+                    try:
+                        unordered_results[dim_name] = future.result()
+                    except Exception as exc:
+                        logger.warning("[情报搜索] %s 异常降级: %s", dim_name, exc)
+                        unordered_results[dim_name] = SearchResponse(
+                            query="", results=[], provider="None", success=False,
+                            error_message=str(exc),
+                        )
+        results = {
+            dim['name']: unordered_results[dim['name']]
+            for dim in selected_dimensions
+            if dim['name'] in unordered_results
+        }
+        if self.news_intel_cache_ttl_seconds > 0:
+            with self._intel_cache_lock:
+                self._intel_cache[cache_key] = (time.time(), dict(results))
+                if len(self._intel_cache) > 256:
+                    oldest = min(self._intel_cache, key=lambda key: self._intel_cache[key][0])
+                    self._intel_cache.pop(oldest, None)
         return results
     
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
@@ -4892,6 +4978,9 @@ def get_search_service() -> SearchService:
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
+                    news_intel_cache_ttl_seconds=getattr(config, "news_intel_cache_ttl_seconds", 300),
+                    search_provider_cooldown_seconds=getattr(config, "search_provider_cooldown_seconds", 1800),
+                    news_search_max_concurrency=getattr(config, "news_search_max_concurrency", 3),
                 )
     
     return _search_service
@@ -4902,6 +4991,10 @@ def reset_search_service() -> None:
     global _search_service
     with _search_service_lock:
         _search_service = None
+    with SearchService._intel_cache_lock:
+        SearchService._intel_cache.clear()
+    with SearchService._provider_cooldown_lock:
+        SearchService._provider_cooldowns.clear()
 
 
 if __name__ == "__main__":

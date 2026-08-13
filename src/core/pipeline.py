@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 核心分析流水线
 
 import logging
 import inspect
+import contextvars
 import threading
 import time
 import uuid
@@ -84,6 +85,7 @@ from src.services.run_diagnostics import (
     reset_run_diagnostic_context,
     sanitize_diagnostic_text,
 )
+from src.services.external_io_limiter import configure_external_io_limit
 from src.services.decision_signal_extractor import (
     extract_and_persist_from_analysis_result,
     resolve_decision_signal_action_fields,
@@ -103,7 +105,6 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
-
 
 def _share_image_payload(result: Any) -> Optional[Dict[str, Any]]:
     """Return structured poster data when the result exposes the real contract."""
@@ -208,6 +209,8 @@ class StockAnalysisPipeline:
     2. 协调数据获取、存储、搜索、分析、通知等模块
     3. 实现并发控制和异常处理
     """
+    _market_structure_context_cache_lock = threading.RLock()
+    _market_structure_context_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
     
     def __init__(
         self,
@@ -285,6 +288,9 @@ class StockAnalysisPipeline:
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
+                news_intel_cache_ttl_seconds=getattr(self.config, "news_intel_cache_ttl_seconds", 300),
+                search_provider_cooldown_seconds=getattr(self.config, "search_provider_cooldown_seconds", 1800),
+                news_search_max_concurrency=getattr(self.config, "news_search_max_concurrency", 3),
             )
         except Exception as exc:
             logger.warning("搜索服务初始化失败，将以无搜索模式运行: %s", exc, exc_info=True)
@@ -408,6 +414,7 @@ class StockAnalysisPipeline:
         report_type: ReportType,
         query_id: str,
         current_time: Optional[datetime] = None,
+        force_refresh: bool = False,
     ) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
@@ -455,50 +462,13 @@ class StockAnalysisPipeline:
                 )
             daily_market_context = self._load_daily_market_context(
                 market,
+                force_refresh=force_refresh,
                 target_date=daily_market_target_date,
             )
 
             self._emit_progress(18, f"{code}：正在获取行情与筹码数据")
             # 获取股票名称（先走轻量名称路径，后续若 realtime_quote 有 name 再覆盖）
             stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
-
-            # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
-            realtime_quote = None
-            try:
-                if self.config.enable_realtime_quote:
-                    realtime_quote = self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
-                    if realtime_quote:
-                        # 使用实时行情返回的真实股票名称
-                        if realtime_quote.name:
-                            stock_name = realtime_quote.name
-                        # 兼容不同数据源的字段（有些数据源可能没有 volume_ratio）
-                        volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
-                        turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
-                        logger.info(f"{stock_name}({code}) 实时行情: 价格={realtime_quote.price}, "
-                                  f"量比={volume_ratio}, 换手率={turnover_rate}% "
-                                  f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
-                    else:
-                        logger.warning(f"{stock_name}({code}) 所有实时行情数据源均不可用，已降级为历史收盘价继续分析")
-                else:
-                    logger.info(f"{stock_name}({code}) 实时行情已禁用，使用历史收盘价继续分析")
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 实时行情链路异常，已降级为历史收盘价继续分析: {e}")
-
-            # 如果还是没有名称，使用代码作为名称
-            if not stock_name:
-                stock_name = f'股票{code}'
-
-            # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
-            chip_data = None
-            try:
-                chip_data = self.fetcher_manager.get_chip_distribution(code)
-                if chip_data:
-                    logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                              f"90%集中度={chip_data.concentration_90:.2%}")
-                else:
-                    logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
 
             # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
             # NOTE: use config.agent_mode (explicit opt-in) instead of
@@ -507,15 +477,115 @@ class StockAnalysisPipeline:
             # switched to Agent mode (which is slower and more expensive).
             use_agent = getattr(self.config, 'agent_mode', False)
             if not use_agent:
-                if self.analysis_skills:
+                if getattr(self, "analysis_skills", None):
                     use_agent = True
-                    logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to request skills: {self.analysis_skills}")
+                    logger.info(
+                        "%s(%s) Auto-enabled agent mode due to request skills: %s",
+                        stock_name, code, self.analysis_skills,
+                    )
             if not use_agent:
                 # Auto-enable agent mode when specific skills are configured (e.g., scheduled task with strategy)
                 configured_skills = getattr(self.config, 'agent_skills', [])
                 if configured_skills and configured_skills != ['all']:
                     use_agent = True
                     logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to configured skills: {configured_skills}")
+
+            if not stock_name:
+                stock_name = f'股票{code}'
+
+            configure_external_io_limit(
+                getattr(self.config, "analysis_global_io_limit", 6)
+            )
+
+            def fetch_quote() -> Any:
+                if not self.config.enable_realtime_quote:
+                    return None
+                if not force_refresh:
+                    return self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
+                return self.fetcher_manager.get_realtime_quote(
+                    code,
+                    log_final_failure=False,
+                    force_refresh=force_refresh,
+                )
+
+            def fetch_chip() -> Any:
+                if not force_refresh:
+                    return self.fetcher_manager.get_chip_distribution(code)
+                return self.fetcher_manager.get_chip_distribution(
+                    code,
+                    force_refresh=force_refresh,
+                )
+
+            def fetch_news() -> Dict[str, Any]:
+                if use_agent or self.search_service is None or not self.search_service.is_available:
+                    return {}
+                if not force_refresh:
+                    return self.search_service.search_comprehensive_intel(
+                        stock_code=code,
+                        stock_name=stock_name,
+                        max_searches=5,
+                    )
+                return self.search_service.search_comprehensive_intel(
+                    stock_code=code,
+                    stock_name=stock_name,
+                    max_searches=5,
+                    force_refresh=force_refresh,
+                )
+
+            branch_calls = {
+                "quote": fetch_quote,
+                "chip": fetch_chip,
+                "news": fetch_news,
+            }
+            branch_results: Dict[str, Any] = {"quote": None, "chip": None, "news": {}}
+            parallel_io = bool(getattr(self.config, "analysis_parallel_io_enabled", True))
+            if parallel_io:
+                worker_count = min(
+                    max(1, int(getattr(self.config, "analysis_io_max_concurrency", 3))),
+                    len(branch_calls),
+                )
+                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="analysis-io") as executor:
+                    futures = {}
+                    for branch_name, branch_call in branch_calls.items():
+                        thread_context = contextvars.copy_context()
+                        future = executor.submit(thread_context.run, branch_call)
+                        futures[future] = branch_name
+                    for future in as_completed(futures):
+                        branch_name = futures[future]
+                        try:
+                            branch_results[branch_name] = future.result()
+                        except Exception as exc:
+                            logger.warning("%s(%s) %s 分支失败，已独立降级: %s", stock_name, code, branch_name, exc)
+            else:
+                logger.info("%s(%s) 外部数据并发已关闭，使用串行兼容路径", stock_name, code)
+                for branch_name, branch_call in branch_calls.items():
+                    try:
+                        branch_results[branch_name] = branch_call()
+                    except Exception as exc:
+                        logger.warning("%s(%s) %s 分支失败，已独立降级: %s", stock_name, code, branch_name, exc)
+
+            realtime_quote = branch_results["quote"]
+            chip_data = branch_results["chip"]
+            intel_results = branch_results["news"] or {}
+            if realtime_quote:
+                if getattr(realtime_quote, "name", None):
+                    stock_name = realtime_quote.name
+                volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
+                turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
+                logger.info(
+                    "%s(%s) 实时行情: 价格=%s, 量比=%s, 换手率=%s%%",
+                    stock_name, code, getattr(realtime_quote, "price", None),
+                    volume_ratio, turnover_rate,
+                )
+            elif self.config.enable_realtime_quote:
+                logger.warning(f"{stock_name}({code}) 所有实时行情数据源均不可用，已降级为历史收盘价继续分析")
+            else:
+                logger.info(f"{stock_name}({code}) 实时行情已禁用，使用历史收盘价继续分析")
+            if chip_data:
+                logger.info(
+                    "%s(%s) 筹码分布: 获利比例=%.1f%%, 90%%集中度=%.2f%%",
+                    stock_name, code, chip_data.profit_ratio * 100, chip_data.concentration_90 * 100,
+                )
 
             self._emit_progress(32, f"{stock_name}：正在聚合基本面与趋势数据")
 
@@ -524,13 +594,19 @@ class StockAnalysisPipeline:
             # - 关闭开关时仍返回 not_supported 结构
             fundamental_context = None
             try:
-                fundamental_context = self.fetcher_manager.get_fundamental_context(
-                    code,
-                    budget_seconds=getattr(
+                fundamental_kwargs = {
+                    "budget_seconds": getattr(
                         self.config,
                         'fundamental_stage_timeout_seconds',
                         FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT,
                     ),
+                    "realtime_quote": realtime_quote,
+                }
+                if force_refresh:
+                    fundamental_kwargs["force_refresh"] = True
+                fundamental_context = self.fetcher_manager.get_fundamental_context(
+                    code,
+                    **fundamental_kwargs,
                 )
             except Exception as e:
                 logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
@@ -539,6 +615,7 @@ class StockAnalysisPipeline:
             fundamental_context = self._attach_belong_boards_to_fundamental_context(
                 code,
                 fundamental_context,
+                force_refresh=force_refresh,
             )
             market_structure_context = self._build_market_structure_context(
                 code=code,
@@ -547,6 +624,7 @@ class StockAnalysisPipeline:
                 fundamental_context=fundamental_context,
                 trade_date=daily_market_target_date,
                 market_phase_summary=market_phase_summary,
+                force_refresh=force_refresh,
             )
 
             # P0: write-only snapshot, fail-open, no read dependency on this table.
@@ -610,15 +688,6 @@ class StockAnalysisPipeline:
             news_result_count: Optional[int] = None
             self._emit_progress(46, f"{stock_name}：正在检索新闻与舆情")
             if self.search_service is not None and self.search_service.is_available:
-                logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
-
-                # 使用多维度搜索（最多5次搜索）
-                intel_results = self.search_service.search_comprehensive_intel(
-                    stock_code=code,
-                    stock_name=stock_name,
-                    max_searches=5
-                )
-
                 # 格式化情报报告
                 if intel_results:
                     news_context = self.search_service.format_intel_report(intel_results, stock_name)
@@ -1113,6 +1182,8 @@ class StockAnalysisPipeline:
         self,
         code: str,
         fundamental_context: Optional[Dict[str, Any]],
+        *,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
         Attach A-share board membership as a top-level supplemental field.
@@ -1134,9 +1205,14 @@ class StockAnalysisPipeline:
 
         existing_boards = enriched_context.get("belong_boards")
         existing_board_list = list(existing_boards) if isinstance(existing_boards, list) else None
-        if existing_board_list:
+        if existing_board_list and not force_refresh:
             enriched_context["belong_boards"] = existing_board_list
-            self._attach_concept_rankings_to_fundamental_context(code, enriched_context, market)
+            self._attach_concept_rankings_to_fundamental_context(
+                code,
+                enriched_context,
+                market,
+                force_refresh=force_refresh,
+            )
             return enriched_context
 
         boards_block = enriched_context.get("boards")
@@ -1158,14 +1234,25 @@ class StockAnalysisPipeline:
 
         boards: List[Dict[str, Any]] = []
         try:
-            raw_boards = self.fetcher_manager.get_belong_boards(code)
+            if force_refresh:
+                raw_boards = self.fetcher_manager.get_belong_boards(
+                    code,
+                    force_refresh=True,
+                )
+            else:
+                raw_boards = self.fetcher_manager.get_belong_boards(code)
             if isinstance(raw_boards, list):
                 boards = raw_boards
         except Exception as e:
             logger.debug("%s attach belong_boards failed (fail-open): %s", code, e)
 
         enriched_context["belong_boards"] = boards or existing_board_list or []
-        self._attach_concept_rankings_to_fundamental_context(code, enriched_context, market)
+        self._attach_concept_rankings_to_fundamental_context(
+            code,
+            enriched_context,
+            market,
+            force_refresh=force_refresh,
+        )
         return enriched_context
 
     def _attach_concept_rankings_to_fundamental_context(
@@ -1173,12 +1260,17 @@ class StockAnalysisPipeline:
         code: str,
         enriched_context: Dict[str, Any],
         market: str,
+        *,
+        force_refresh: bool = False,
     ) -> None:
         """Attach concept/theme rankings for A-share related-board signals."""
         if market != "cn" or isinstance(enriched_context.get("concept_boards"), dict):
             return
 
-        top_concepts, bottom_concepts = self._get_concept_rankings_for_market(market)
+        top_concepts, bottom_concepts = self._get_concept_rankings_for_market(
+            market,
+            force_refresh=force_refresh,
+        )
 
         concept_data: Dict[str, Any] = {
             "top": top_concepts,
@@ -1197,6 +1289,8 @@ class StockAnalysisPipeline:
     def _get_concept_rankings_for_market(
         self,
         market: str,
+        *,
+        force_refresh: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Fetch market-wide concept rankings once per pipeline run."""
         if market != "cn":
@@ -1226,7 +1320,7 @@ class StockAnalysisPipeline:
             self._concept_rankings_cache_lock = lock
 
         with lock:
-            if market in cache:
+            if market in cache and not force_refresh:
                 top_concepts, bottom_concepts = cache[market]
                 return list(top_concepts), list(bottom_concepts)
 
@@ -1236,7 +1330,11 @@ class StockAnalysisPipeline:
                 if service is None:
                     fetch_rankings = getattr(self.fetcher_manager, "get_concept_rankings", None)
                     if callable(fetch_rankings):
-                        rankings = fetch_rankings(5)
+                        rankings = (
+                            fetch_rankings(5, force_refresh=True)
+                            if force_refresh
+                            else fetch_rankings(5)
+                        )
                         if isinstance(rankings, tuple) and len(rankings) == 2:
                             raw_top, raw_bottom = rankings
                             if isinstance(raw_top, list):
@@ -1244,7 +1342,13 @@ class StockAnalysisPipeline:
                             if isinstance(raw_bottom, list):
                                 bottom_concepts = list(raw_bottom)
                 else:
-                    top_concepts, bottom_concepts = service.get_concept_rankings(5)
+                    if force_refresh:
+                        top_concepts, bottom_concepts = service.get_concept_rankings(
+                            5,
+                            force_refresh=True,
+                        )
+                    else:
+                        top_concepts, bottom_concepts = service.get_concept_rankings(5)
             except Exception as e:
                 logger.debug("attach concept_rankings failed (fail-open): %s", e)
 
@@ -1260,8 +1364,25 @@ class StockAnalysisPipeline:
         fundamental_context: Optional[Dict[str, Any]],
         trade_date: Any = None,
         market_phase_summary: Optional[Dict[str, Any]] = None,
+        force_refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Build market structure context without blocking the main analysis."""
+        cache_ttl = int(getattr(self.config, "market_structure_cache_ttl_seconds", 1800))
+        phase_name = ""
+        if isinstance(market_phase_summary, dict):
+            phase_name = str(
+                market_phase_summary.get("phase")
+                or market_phase_summary.get("market_phase")
+                or ""
+            )
+        cache_key = "|".join((normalize_stock_code(code), str(trade_date or ""), phase_name))
+        now_ts = time.time()
+        if cache_ttl > 0 and not force_refresh:
+            with self._market_structure_context_cache_lock:
+                cached = self._market_structure_context_cache.get(cache_key)
+                if cached and now_ts - cached[0] <= cache_ttl:
+                    logger.info("[市场结构缓存] %s 命中", code)
+                    return dict(cached[1]) if isinstance(cached[1], dict) else cached[1]
         service = getattr(self, "market_structure_service", None)
         if service is None:
             try:
@@ -1271,7 +1392,7 @@ class StockAnalysisPipeline:
                 logger.debug("market structure service init failed (fail-open): %s", exc)
                 return None
         try:
-            return service.build_context(
+            context = service.build_context(
                 code=code,
                 stock_name=stock_name,
                 market=market,
@@ -1279,6 +1400,17 @@ class StockAnalysisPipeline:
                 trade_date=trade_date,
                 market_phase_summary=market_phase_summary,
             )
+            if cache_ttl > 0:
+                with self._market_structure_context_cache_lock:
+                    cached_context = dict(context) if isinstance(context, dict) else context
+                    self._market_structure_context_cache[cache_key] = (time.time(), cached_context)
+                    if len(self._market_structure_context_cache) > 512:
+                        oldest = min(
+                            self._market_structure_context_cache,
+                            key=lambda key: self._market_structure_context_cache[key][0],
+                        )
+                        self._market_structure_context_cache.pop(oldest, None)
+            return context
         except Exception as exc:
             logger.debug(
                 "%s market structure context build failed (fail-open): %s",
@@ -3023,6 +3155,7 @@ class StockAnalysisPipeline:
         report_type: ReportType = ReportType.SIMPLE,
         analysis_query_id: Optional[str] = None,
         current_time: Optional[datetime] = None,
+        force_refresh: bool = False,
     ) -> Optional[AnalysisResult]:
         """
         处理单只股票的完整流程
@@ -3042,6 +3175,7 @@ class StockAnalysisPipeline:
             single_stock_notify: 是否启用单股推送模式（每分析完一只立即推送）
             report_type: 报告类型枚举（从配置读取，Issue #119）
             current_time: 本轮运行冻结的参考时间，用于统一断点续传目标交易日判断
+            force_refresh: 是否绕过分析数据缓存并重新获取
 
         Returns:
             AnalysisResult 或 None
@@ -3064,9 +3198,10 @@ class StockAnalysisPipeline:
         try:
             self._emit_progress(12, f"{code}：正在准备分析任务")
             # Step 1: 获取并保存数据
-            success, error = self.fetch_and_save_stock_data(
-                code, current_time=current_time
-            )
+            fetch_kwargs = {"current_time": current_time}
+            if force_refresh:
+                fetch_kwargs["force_refresh"] = True
+            success, error = self.fetch_and_save_stock_data(code, **fetch_kwargs)
             
             if not success:
                 logger.warning(f"[{code}] 数据获取失败: {error}")
@@ -3080,6 +3215,8 @@ class StockAnalysisPipeline:
                 return None
             
             analyze_kwargs = {"query_id": effective_query_id}
+            if force_refresh:
+                analyze_kwargs["force_refresh"] = True
             if current_time is not None:
                 analyze_kwargs["current_time"] = current_time
             result = self.analyze_stock(code, report_type, **analyze_kwargs)

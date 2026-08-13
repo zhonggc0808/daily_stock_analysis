@@ -1465,6 +1465,26 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         self.assertEqual(result, {"stock_code": "600519"})
         self.assertEqual(pipeline_cls.call_args.kwargs["analysis_skills"], request_skills)
 
+    def test_analysis_service_passes_force_refresh_to_pipeline(self) -> None:
+        service = object.__new__(AnalysisService)
+        pipeline_instance = MagicMock()
+        pipeline_instance.process_single_stock.return_value = object()
+
+        with patch("src.config.get_config", return_value=SimpleNamespace()), \
+             patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline_instance), \
+             patch.object(AnalysisService, "_build_analysis_response", return_value={"stock_code": "600519"}):
+            result = AnalysisService.analyze_stock(
+                service,
+                "600519",
+                query_id="q-force-refresh",
+                force_refresh=True,
+            )
+
+        self.assertEqual(result, {"stock_code": "600519"})
+        self.assertTrue(
+            pipeline_instance.process_single_stock.call_args.kwargs["force_refresh"]
+        )
+
     def test_report_type_full_is_preserved_in_response_metadata(self) -> None:
         service = AnalysisService()
         pipeline_instance = MagicMock()

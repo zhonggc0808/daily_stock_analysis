@@ -28,6 +28,7 @@ from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.services.market_symbol_utils import is_suffix_market_symbol
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
+from src.services.external_io_limiter import external_io_slot
 from .fundamental_adapter import AkshareFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .realtime_types import CircuitBreaker
@@ -633,6 +634,14 @@ class DataFetcherManager:
     _CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS = 30.0
     _concept_rankings_cache_lock = RLock()
     _concept_rankings_cache: Dict[int, Tuple[float, List[Dict], List[Dict]]] = {}
+    _realtime_cache_lock = RLock()
+    _realtime_cache: Dict[str, Tuple[float, Any]] = {}
+    _chip_cache_lock = RLock()
+    _chip_cache: Dict[str, Tuple[float, Any, bool]] = {}
+    _boards_cache_lock = RLock()
+    _boards_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+    _fundamental_cache_lock = RLock()
+    _fundamental_cache: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
@@ -648,6 +657,17 @@ class DataFetcherManager:
         self._fetcher_call_locks_lock = RLock()
         self._stock_name_cache: Dict[str, str] = {}
         self._stock_name_cache_lock = RLock()
+        # Explicit fetcher injection is used by tests and specialized callers;
+        # keep those caches isolated while default managers share process caches.
+        if fetchers is not None:
+            self._realtime_cache_lock = RLock()
+            self._realtime_cache = {}
+            self._chip_cache_lock = RLock()
+            self._chip_cache = {}
+            self._boards_cache_lock = RLock()
+            self._boards_cache = {}
+            self._fundamental_cache_lock = RLock()
+            self._fundamental_cache = {}
         
         if fetchers:
             # 按优先级排序
@@ -661,8 +681,6 @@ class DataFetcherManager:
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
-        self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
-        self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
         self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
 
@@ -744,8 +762,14 @@ class DataFetcherManager:
     def _call_fetcher_method(self, fetcher: BaseFetcher, method_name: str, *args, **kwargs):
         """Serialize shared fetcher state access through manager-owned per-instance locks."""
         method = getattr(fetcher, method_name)
-        with self._get_fetcher_call_lock(fetcher):
-            return method(*args, **kwargs)
+        with external_io_slot():
+            with self._get_fetcher_call_lock(fetcher):
+                return method(*args, **kwargs)
+
+    @staticmethod
+    def _call_external_io(callable_: Callable[[], Any]) -> Any:
+        with external_io_slot():
+            return callable_()
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -771,6 +795,57 @@ class DataFetcherManager:
                 ", ".join(skipped),
             )
         return kept
+
+    @staticmethod
+    def _daily_source_token(fetcher_name: str) -> str:
+        return fetcher_name.removesuffix("Fetcher").lower()
+
+    @classmethod
+    def _order_cn_daily_fetchers(
+        cls,
+        fetchers: List[BaseFetcher],
+        priority: str,
+    ) -> List[BaseFetcher]:
+        """Apply the dedicated A-share daily order without changing other markets."""
+        tokens = [token.strip().lower() for token in (priority or "").split(",") if token.strip()]
+        order = {token: index for index, token in enumerate(tokens)}
+        return sorted(
+            fetchers,
+            key=lambda fetcher: (
+                order.get(cls._daily_source_token(fetcher.name), len(order)),
+                fetchers.index(fetcher),
+            ),
+        )
+
+    @staticmethod
+    def _validate_tencent_daily_data(
+        df: pd.DataFrame,
+        *,
+        end_date: Optional[str],
+        days: int,
+    ) -> Tuple[bool, str]:
+        if df is None or df.empty:
+            return False, "empty result"
+        required = {"date", "open", "high", "low", "close"}
+        missing = sorted(required.difference(df.columns))
+        if missing:
+            return False, f"missing columns: {','.join(missing)}"
+        minimum_rows = 1
+        if len(df) < minimum_rows:
+            return False, f"insufficient rows: {len(df)} < {minimum_rows}"
+        try:
+            dates = pd.to_datetime(df["date"], errors="coerce")
+            ohlc = df[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+            if dates.isna().all() or ohlc.isna().any().any():
+                return False, "invalid date or OHLC values"
+            if end_date:
+                requested_end = pd.Timestamp(end_date).normalize()
+                latest = dates.max().normalize()
+                if latest < requested_end - pd.Timedelta(days=10):
+                    return False, f"stale latest date: {latest.date()}"
+        except (TypeError, ValueError, KeyError) as exc:
+            return False, f"validation error: {exc}"
+        return True, ""
 
     @classmethod
     def _filter_fetchers_by_capability(
@@ -1295,6 +1370,20 @@ class DataFetcherManager:
         if market != "cn":
             fetchers = self._filter_daily_fetchers_for_market(fetchers, market)
         fetchers = self._filter_fetchers_by_capability(fetchers, capability="daily_data")
+        if market == "cn":
+            from src.config import get_config
+            fetchers = self._order_cn_daily_fetchers(
+                fetchers,
+                getattr(
+                    get_config(),
+                    "cn_daily_source_priority",
+                    "tencent,efinance,akshare,pytdx,baostock,yfinance",
+                ),
+            )
+            logger.info(
+                "[数据源路由] A股日线顺序: %s",
+                " -> ".join(fetcher.name for fetcher in fetchers),
+            )
         total_fetchers = len(fetchers)
 
         if total_fetchers == 0:
@@ -1429,6 +1518,24 @@ class DataFetcherManager:
                     days=days
                 )
                 
+                if fetcher.name == "TencentFetcher":
+                    valid, invalid_reason = self._validate_tencent_daily_data(
+                        df,
+                        end_date=end_date,
+                        days=days,
+                    )
+                    if not valid:
+                        logger.warning(
+                            "[数据源校验] TencentFetcher %s 日线无效，切换数据源: %s",
+                            stock_code,
+                            invalid_reason,
+                        )
+                        # The provider responded normally but its payload was not
+                        # usable. Release any half-open probe so a later request
+                        # can retry after the upstream data recovers.
+                        self._record_daily_source_success(fetcher, market)
+                        df = None
+
                 if df is not None and not df.empty:
                     duration_ms = int((time.time() - attempt_start) * 1000)
                     record_provider_run(
@@ -1722,7 +1829,48 @@ class DataFetcherManager:
         setattr(quote, "is_stale", stale_seconds > int(ttl))
         return quote
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        force_refresh: bool = False,
+    ):
+        """Return a process-cached quote with a shorter TTL during trading."""
+        from src.config import get_config
+        from src.core.trading_calendar import MarketPhase, get_market_for_stock, infer_market_phase
+
+        normalized = normalize_stock_code(stock_code)
+        config = get_config()
+        if not config.enable_realtime_quote:
+            logger.debug("[实时行情] 功能已禁用，跳过 %s", normalized)
+            return None
+        market = get_market_for_stock(normalized)
+        phase = infer_market_phase(market)
+        is_open = phase in {MarketPhase.INTRADAY, MarketPhase.CLOSING_AUCTION}
+        ttl = int(
+            getattr(config, "realtime_cache_ttl", 30)
+            if is_open
+            else getattr(config, "realtime_closed_cache_ttl", 300)
+        )
+        now_ts = time.time()
+        if ttl > 0 and not force_refresh:
+            with self._realtime_cache_lock:
+                cached = self._realtime_cache.get(normalized)
+                if cached and now_ts - cached[0] <= ttl:
+                    logger.info("[实时行情缓存] %s 命中 (ttl=%ss)", normalized, ttl)
+                    return cached[1]
+
+        quote = self._get_realtime_quote_uncached(stock_code, log_final_failure=log_final_failure)
+        if quote is not None and ttl > 0:
+            with self._realtime_cache_lock:
+                self._realtime_cache[normalized] = (now_ts, quote)
+                if len(self._realtime_cache) > 512:
+                    oldest = min(self._realtime_cache, key=lambda key: self._realtime_cache[key][0])
+                    self._realtime_cache.pop(oldest, None)
+        return quote
+
+    def _get_realtime_quote_uncached(self, stock_code: str, *, log_final_failure: bool = True):
         """
         获取实时行情数据（自动故障切换）
         
@@ -2118,7 +2266,7 @@ class DataFetcherManager:
         """Shortcut kept for backward-compat with A-share general loop."""
         return self._supplement_quote(stock_code, primary_quote, "LongbridgeFetcher")
 
-    def get_chip_distribution(self, stock_code: str):
+    def get_chip_distribution(self, stock_code: str, *, force_refresh: bool = False):
         """
         获取筹码分布数据（带熔断和多数据源降级）
 
@@ -2142,10 +2290,28 @@ class DataFetcherManager:
 
         config = get_config()
 
-        # 如果筹码分布功能被禁用，直接返回 None
+        # Check the switch before cache lookup so runtime disable takes effect immediately.
         if not config.enable_chip_distribution:
             logger.debug(f"[筹码分布] 功能已禁用，跳过 {stock_code}")
             return None
+
+        now_ts = time.time()
+        if not force_refresh:
+            with self._chip_cache_lock:
+                cached = self._chip_cache.get(stock_code)
+                if cached:
+                    ttl = int(
+                        getattr(config, "chip_cache_ttl_seconds", 1800)
+                        if cached[2]
+                        else getattr(config, "chip_failure_cache_ttl_seconds", 600)
+                    )
+                    if ttl > 0 and now_ts - cached[0] <= ttl:
+                        logger.info(
+                            "[筹码缓存] %s 命中 (%s)",
+                            stock_code,
+                            "成功" if cached[2] else "失败",
+                        )
+                        return cached[1]
 
         circuit_breaker = get_chip_circuit_breaker()
 
@@ -2193,6 +2359,8 @@ class DataFetcherManager:
                     )
                     circuit_breaker.record_success(source_key)
                     logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})")
+                    with self._chip_cache_lock:
+                        self._chip_cache[stock_code] = (now_ts, chip, True)
                     return chip
                 else:
                     record_provider_run(
@@ -2230,6 +2398,8 @@ class DataFetcherManager:
                 continue
 
         logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
+        with self._chip_cache_lock:
+            self._chip_cache[stock_code] = (now_ts, None, False)
         return None
 
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
@@ -2302,7 +2472,12 @@ class DataFetcherManager:
         logger.warning(f"[股票名称] 所有数据源都无法获取 {stock_code} 的名称")
         return ""
 
-    def get_belong_boards(self, stock_code: str) -> List[Dict[str, Any]]:
+    def get_belong_boards(
+        self,
+        stock_code: str,
+        *,
+        force_refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         Get stock membership boards through capability probing.
 
@@ -2311,6 +2486,15 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         if _market_tag(stock_code) != "cn":
             return []
+        from src.config import get_config
+        cache_ttl = int(getattr(get_config(), "market_structure_cache_ttl_seconds", 1800))
+        now_ts = time.time()
+        if cache_ttl > 0 and not force_refresh:
+            with self._boards_cache_lock:
+                cached = self._boards_cache.get(stock_code)
+                if cached and now_ts - cached[0] <= cache_ttl:
+                    logger.info("[板块缓存] %s 命中", stock_code)
+                    return list(cached[1])
         candidate_fetchers = [
             fetcher
             for fetcher in self._fetchers
@@ -2329,7 +2513,7 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_belong_board",
                 )
-                raw_data = fetcher.get_belong_board(stock_code)
+                raw_data = self._call_fetcher_method(fetcher, "get_belong_board", stock_code)
                 boards = self._normalize_belong_boards(raw_data)
                 if boards:
                     record_provider_run(
@@ -2341,6 +2525,8 @@ class DataFetcherManager:
                         record_count=len(boards),
                     )
                     logger.info(f"[{fetcher.name}] 获取所属板块成功: {stock_code}, count={len(boards)}")
+                    with self._boards_cache_lock:
+                        self._boards_cache[stock_code] = (now_ts, list(boards))
                     return boards
                 record_provider_run(
                     data_type="belong_boards",
@@ -2367,6 +2553,9 @@ class DataFetcherManager:
                 )
                 logger.debug(f"[{fetcher.name}] 获取所属板块失败: {e}")
                 continue
+        if cache_ttl > 0:
+            with self._boards_cache_lock:
+                self._boards_cache[stock_code] = (now_ts, [])
         return []
 
     def prefetch_stock_names(self, stock_codes: List[str], use_bulk: bool = False) -> None:
@@ -2845,6 +3034,7 @@ class DataFetcherManager:
         stock_code: str,
         market: str,
         budget_seconds: Optional[float] = None,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """HK/US fundamental aggregation via yfinance.
 
@@ -2868,7 +3058,7 @@ class DataFetcherManager:
         cache_ttl = int(config.fundamental_cache_ttl_seconds)
         cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
-        if cache_ttl > 0:
+        if cache_ttl > 0 and not force_refresh:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
             with self._fundamental_cache_lock:
                 cache_item = self._fundamental_cache.get(cache_key)
@@ -2902,7 +3092,10 @@ class DataFetcherManager:
         valuation_timeout = min(fetch_timeout, stage_timeout) if stage_timeout > 0 else 0
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
-                lambda: self.get_realtime_quote(stock_code),
+                lambda: self.get_realtime_quote(
+                    stock_code,
+                    force_refresh=force_refresh,
+                ),
                 valuation_timeout,
                 "fundamental_valuation",
             )
@@ -2938,7 +3131,9 @@ class DataFetcherManager:
             bundle_payload, bundle_err, bundle_ms = {}, "fundamental stage timeout", 0
         else:
             bundle_payload, bundle_err, bundle_ms = self._run_with_retry(
-                lambda: self._yfinance_fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._call_external_io(
+                    lambda: self._yfinance_fundamental_adapter.get_fundamental_bundle(stock_code)
+                ),
                 bundle_timeout,
                 "fundamental_bundle_yfinance",
             )
@@ -3133,7 +3328,9 @@ class DataFetcherManager:
     def get_fundamental_context(
         self,
         stock_code: str,
-        budget_seconds: Optional[float] = None
+        budget_seconds: Optional[float] = None,
+        realtime_quote: Any = None,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
         Aggregate fundamental blocks with fail-open semantics.
@@ -3155,6 +3352,7 @@ class DataFetcherManager:
                 stock_code,
                 market=market,
                 budget_seconds=budget_seconds,
+                force_refresh=force_refresh,
             )
 
         stage_timeout = float(
@@ -3167,7 +3365,7 @@ class DataFetcherManager:
         cache_ttl = int(config.fundamental_cache_ttl_seconds)
         cache_max_entries = max(0, int(getattr(config, "fundamental_cache_max_entries", 256)))
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
-        if cache_ttl > 0:
+        if cache_ttl > 0 and not force_refresh:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
             with self._fundamental_cache_lock:
                 cache_item = self._fundamental_cache.get(cache_key)
@@ -3198,9 +3396,14 @@ class DataFetcherManager:
             remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
 
         valuation_timeout = min(fetch_timeout, remaining_seconds)
-        if valuation_timeout > 0:
+        if realtime_quote is not None:
+            quote_payload, valuation_err, valuation_ms = realtime_quote, None, 0
+        elif valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
-                lambda: self.get_realtime_quote(stock_code),
+                lambda: self.get_realtime_quote(
+                    stock_code,
+                    force_refresh=force_refresh,
+                ),
                 valuation_timeout,
                 "fundamental_valuation",
             )
@@ -3241,7 +3444,9 @@ class DataFetcherManager:
         else:
             bundle_timeout = min(fetch_timeout, remaining_seconds)
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._call_external_io(
+                    lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code)
+                ),
                 bundle_timeout,
                 "fundamental_bundle",
             )
@@ -3457,7 +3662,9 @@ class DataFetcherManager:
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+            lambda: self._call_external_io(
+                lambda: self._fundamental_adapter.get_capital_flow(stock_code)
+            ),
             timeout,
             "capital_flow",
         )
@@ -3521,7 +3728,9 @@ class DataFetcherManager:
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_dragon_tiger_flag(stock_code),
+            lambda: self._call_external_io(
+                lambda: self._fundamental_adapter.get_dragon_tiger_flag(stock_code)
+            ),
             timeout,
             "dragon_tiger",
         )
@@ -3677,7 +3886,12 @@ class DataFetcherManager:
         with cls._concept_rankings_cache_lock:
             cls._concept_rankings_cache.clear()
 
-    def get_concept_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
+    def get_concept_rankings(
+        self,
+        n: int = 5,
+        *,
+        force_refresh: bool = False,
+    ) -> Tuple[List[Dict], List[Dict]]:
         """获取概念/题材涨跌榜（自动切换数据源）。"""
         try:
             normalized_n = int(n)
@@ -3691,7 +3905,7 @@ class DataFetcherManager:
 
         with self.__class__._concept_rankings_cache_lock:
             cached = self.__class__._concept_rankings_cache.get(normalized_n)
-            if cached and cached[0] > now:
+            if cached and cached[0] > now and not force_refresh:
                 logger.debug("[概念排行] 命中共享缓存 n=%s", normalized_n)
                 return self._copy_ranking_rows(cached[1]), self._copy_ranking_rows(cached[2])
 

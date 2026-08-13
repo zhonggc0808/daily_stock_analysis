@@ -263,8 +263,15 @@ class MarketHotspotService:
     def get_concept_rankings(
         self,
         limit: int = 5,
+        *,
+        force_refresh: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Get concept ranking top/bottom with timeout + concurrency protection."""
+        if force_refresh:
+            return self.fetcher_manager.get_concept_rankings(
+                limit,
+                force_refresh=True,
+            )
         errors: List[str] = []
         sources: List[MarketStructureSource] = []
         return self._resolve_rankings(

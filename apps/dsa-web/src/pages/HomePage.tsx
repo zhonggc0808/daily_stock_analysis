@@ -1,6 +1,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, Check, SlidersHorizontal, X } from 'lucide-react';
+import { BarChart3, Check, MessageCircle, RefreshCw, RotateCw, SlidersHorizontal, X } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi, DuplicateTaskError } from '../api/analysis';
@@ -877,6 +877,21 @@ const HomePage: React.FC = () => {
       stockName: selectedReport.meta.stockName,
       originalQuery: selectedReport.meta.stockCode,
       selectionSource: 'manual',
+      forceRefresh: false,
+      skills: selectedAnalysisSkills,
+    });
+  }, [selectedAnalysisSkills, selectedReport, submitAnalysis]);
+
+  const handleForceReanalyze = useCallback(() => {
+    if (!selectedReport || selectedReport.meta.reportType === 'market_review') {
+      return;
+    }
+
+    void submitAnalysis({
+      stockCode: selectedReport.meta.stockCode,
+      stockName: selectedReport.meta.stockName,
+      originalQuery: selectedReport.meta.stockCode,
+      selectionSource: 'manual',
       forceRefresh: true,
       skills: selectedAnalysisSkills,
     });
@@ -1686,10 +1701,19 @@ const HomePage: React.FC = () => {
                         disabled={isAnalyzing || selectedReport.meta.id === undefined}
                         onClick={handleReanalyze}
                       >
-                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                        </svg>
+                        <RefreshCw className="h-4 w-4" />
                         {t('home.reanalyze')}
+                      </Button>
+                      <Button
+                        variant="home-action-ai"
+                        size="sm"
+                        className="w-9 px-0"
+                        disabled={isAnalyzing || selectedReport.meta.id === undefined}
+                        onClick={handleForceReanalyze}
+                        title="强制刷新数据并重新分析"
+                        aria-label="强制刷新数据并重新分析"
+                      >
+                        <RotateCw className="h-4 w-4" />
                       </Button>
                       <Button
                         variant="home-action-ai"
@@ -1697,9 +1721,7 @@ const HomePage: React.FC = () => {
                         disabled={selectedReport.meta.id === undefined}
                         onClick={handleAskFollowUp}
                       >
-                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                        </svg>
+                        <MessageCircle className="h-4 w-4" />
                         {t('home.askAi')}
                       </Button>
                     </>

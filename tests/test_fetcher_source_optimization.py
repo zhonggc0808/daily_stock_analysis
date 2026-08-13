@@ -80,6 +80,55 @@ def _make_daily_df() -> pd.DataFrame:
 
 
 class TestFetcherSourceOptimization(unittest.TestCase):
+    def test_cn_daily_priority_is_dedicated_and_stable(self):
+        fetchers = [
+            _StubFetcher("AkshareFetcher", 1),
+            _StubFetcher("TencentFetcher", 5),
+            _StubFetcher("EfinanceFetcher", 0),
+        ]
+
+        ordered = DataFetcherManager._order_cn_daily_fetchers(
+            fetchers,
+            "tencent,efinance,akshare",
+        )
+
+        self.assertEqual(
+            [fetcher.name for fetcher in ordered],
+            ["TencentFetcher", "EfinanceFetcher", "AkshareFetcher"],
+        )
+        self.assertEqual(
+            [fetcher.name for fetcher in fetchers],
+            ["AkshareFetcher", "TencentFetcher", "EfinanceFetcher"],
+        )
+
+    @patch("src.config.get_config")
+    def test_invalid_tencent_daily_data_falls_back(self, mock_get_config):
+        mock_get_config.return_value = SimpleNamespace(
+            cn_daily_source_priority="tencent,akshare",
+        )
+        tencent = MagicMock(name="TencentFetcher")
+        tencent.name = "TencentFetcher"
+        tencent.priority = 0
+        tencent.get_daily_data.return_value = pd.DataFrame(
+            [{"date": "2020-01-01", "open": 1, "high": 1, "low": 1, "close": 1}]
+        )
+        akshare = MagicMock(name="AkshareFetcher")
+        akshare.name = "AkshareFetcher"
+        akshare.priority = 1
+        akshare.get_daily_data.return_value = _make_daily_df()
+        manager = DataFetcherManager(fetchers=[akshare, tencent])
+
+        df, source = manager.get_daily_data(
+            "000001",
+            start_date="2026-05-01",
+            end_date="2026-05-08",
+        )
+
+        self.assertFalse(df.empty)
+        self.assertEqual(source, "AkshareFetcher")
+        tencent.get_daily_data.assert_called_once()
+        akshare.get_daily_data.assert_called_once()
+
     def test_base_fetcher_returns_opt_in_empty_daily_data_without_error(self):
         df = _EmptyRawFetcher().get_daily_data(
             "000001",
@@ -156,7 +205,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
         mock_longbridge.assert_not_called()
 
     @patch("src.config.get_config")
-    def test_daily_fallback_tries_akshare_before_tencent(self, mock_get_config):
+    def test_cn_daily_default_tries_tencent_first(self, mock_get_config):
         mock_get_config.return_value = SimpleNamespace()
         DataFetcherManager.reset_daily_source_health()
         try:
@@ -183,14 +232,14 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             )
 
             self.assertFalse(df.empty)
-            self.assertEqual(source, "AkshareFetcher")
+            self.assertEqual(source, "TencentFetcher")
             self.assertEqual(
                 manager.available_fetchers,
                 ["EfinanceFetcher", "AkshareFetcher", "TencentFetcher"],
             )
-            efinance.get_daily_data.assert_called_once()
-            akshare.get_daily_data.assert_called_once()
-            tencent.get_daily_data.assert_not_called()
+            efinance.get_daily_data.assert_not_called()
+            akshare.get_daily_data.assert_not_called()
+            tencent.get_daily_data.assert_called_once()
         finally:
             DataFetcherManager.reset_daily_source_health()
 
@@ -290,6 +339,29 @@ class TestFetcherSourceOptimization(unittest.TestCase):
         yfinance.get_realtime_quote.assert_called_once_with("AAPL")
 
     @patch("src.config.get_config")
+    def test_force_refresh_bypasses_realtime_quote_cache(self, mock_get_config):
+        mock_get_config.return_value = SimpleNamespace(
+            enable_realtime_quote=True,
+            realtime_source_priority="efinance,akshare_em,tushare",
+            realtime_cache_ttl=600,
+            realtime_closed_cache_ttl=600,
+        )
+        cached_quote = _make_quote("AAPL")
+        fresh_quote = _make_quote("AAPL")
+        fresh_quote.price = 199.9
+        yfinance = MagicMock()
+        yfinance.name = "YfinanceFetcher"
+        yfinance.priority = 4
+        yfinance.get_realtime_quote.return_value = fresh_quote
+        manager = DataFetcherManager(fetchers=[yfinance])
+        manager._realtime_cache["AAPL"] = (float("inf"), cached_quote)
+
+        quote = manager.get_realtime_quote("AAPL", force_refresh=True)
+
+        self.assertIs(quote, fresh_quote)
+        yfinance.get_realtime_quote.assert_called_once_with("AAPL")
+
+    @patch("src.config.get_config")
     def test_us_daily_route_skips_temporarily_unavailable_longbridge(self, mock_get_config):
         mock_get_config.return_value = SimpleNamespace(
             longbridge_app_key="app-key",
@@ -346,7 +418,9 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_skips_repeatedly_failing_source(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(
+            cn_daily_source_priority="efinance,tencent",
+        )
         DataFetcherManager.reset_daily_source_health()
         try:
             flaky = MagicMock()
@@ -379,7 +453,9 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_does_not_skip_source_after_empty_results(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(
+            cn_daily_source_priority="efinance,tencent",
+        )
         DataFetcherManager.reset_daily_source_health()
         try:
             primary = MagicMock()
@@ -412,7 +488,9 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_does_not_preconsume_half_open_fallback(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(
+            cn_daily_source_priority="efinance,tencent",
+        )
         DataFetcherManager.reset_daily_source_health()
         try:
             primary = MagicMock()
@@ -452,7 +530,9 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_releases_half_open_probe_after_empty_result(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(
+            cn_daily_source_priority="efinance,tencent,akshare",
+        )
         DataFetcherManager.reset_daily_source_health()
         try:
             primary = MagicMock()

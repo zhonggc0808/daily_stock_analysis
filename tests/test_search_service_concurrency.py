@@ -106,6 +106,102 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
         self.assertIsNone(event)
         self.assertNotIn(cache_key, service._cache_inflight)
 
+    def test_comprehensive_intel_is_bounded_and_preserves_dimension_order(self):
+        service = SearchService(
+            searxng_public_instances_enabled=False,
+            news_search_max_concurrency=2,
+            news_intel_cache_ttl_seconds=0,
+        )
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def search(query, max_results, days=7, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return SearchResponse(query=query, results=[], provider="Mock", success=True)
+
+        service._providers = [SimpleNamespace(is_available=True, name="Mock", search=search)]
+        results = service.search_comprehensive_intel("600519", "贵州茅台", max_searches=5)
+
+        self.assertLessEqual(peak, 2)
+        self.assertEqual(
+            list(results),
+            ["latest_news", "market_analysis", "risk_check", "announcements", "earnings"],
+        )
+
+    def test_comprehensive_intel_cools_rate_limited_provider_and_falls_back(self):
+        service = SearchService(
+            searxng_public_instances_enabled=False,
+            news_search_max_concurrency=1,
+            news_intel_cache_ttl_seconds=0,
+            search_provider_cooldown_seconds=1800,
+        )
+        limited = SimpleNamespace(
+            is_available=True,
+            name="Limited",
+            search=MagicMock(return_value=SearchResponse(
+                query="q", results=[], provider="Limited", success=False,
+                error_message="HTTP 429 Too Many Requests",
+            )),
+        )
+        healthy = SimpleNamespace(
+            is_available=True,
+            name="Healthy",
+            search=MagicMock(side_effect=lambda query, **_kwargs: SearchResponse(
+                query=query, results=[], provider="Healthy", success=True,
+            )),
+        )
+        service._providers = [limited, healthy]
+
+        results = service.search_comprehensive_intel("600519", "贵州茅台", max_searches=1)
+
+        self.assertEqual(results["latest_news"].provider, "Healthy")
+        limited.search.assert_called_once()
+        healthy.search.assert_called_once()
+        self.assertGreater(service._provider_cooldowns["Limited"], time.time())
+
+    def test_force_refresh_bypasses_comprehensive_intel_cache(self):
+        service = SearchService(
+            searxng_public_instances_enabled=False,
+            news_search_max_concurrency=1,
+            news_intel_cache_ttl_seconds=300,
+        )
+        cached_response = SearchResponse(
+            query="cached",
+            results=[],
+            provider="Cache",
+            success=True,
+        )
+        cache_key = "600519|贵州茅台|3|1|short"
+        service._intel_cache[cache_key] = (time.time(), {"latest_news": cached_response})
+        provider = SimpleNamespace(
+            is_available=True,
+            name="FreshProvider",
+            search=MagicMock(side_effect=lambda query, **_kwargs: SearchResponse(
+                query=query,
+                results=[],
+                provider="FreshProvider",
+                success=True,
+            )),
+        )
+        service._providers = [provider]
+
+        result = service.search_comprehensive_intel(
+            "600519",
+            "贵州茅台",
+            max_searches=1,
+            force_refresh=True,
+        )
+
+        self.assertEqual(result["latest_news"].provider, "FreshProvider")
+        provider.search.assert_called_once()
+
     def test_provider_key_rotation_is_serialized(self):
         provider = _DummyProvider(["key-1", "key-2"])
         provider._key_cycle = _ThreadUnsafeCycle(["key-1", "key-2"])

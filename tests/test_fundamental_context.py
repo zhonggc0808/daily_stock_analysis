@@ -253,6 +253,32 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertIn("capital_flow", ctx)
         self.assertIn("dragon_tiger", ctx)
 
+    def test_fundamental_context_reuses_injected_realtime_quote(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=0,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        quote = SimpleNamespace(
+            pe_ratio=12.3, pb_ratio=2.1, total_mv=100.0, circ_mv=80.0,
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", side_effect=AssertionError("duplicate quote fetch")), \
+                patch.object(manager._fundamental_adapter, "get_fundamental_bundle", return_value={}), \
+                patch.object(manager, "get_capital_flow_context", return_value={"status": "partial"}), \
+                patch.object(manager, "get_dragon_tiger_context", return_value={"status": "partial"}), \
+                patch.object(manager, "get_board_context", return_value={"status": "partial"}):
+            ctx = manager.get_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                realtime_quote=quote,
+            )
+
+        self.assertEqual(ctx["valuation"]["data"]["pe_ratio"], 12.3)
+
     def test_fundamental_context_derives_ttm_dividend_yield_from_quote_price(self) -> None:
         manager = DataFetcherManager(fetchers=[])
         cfg = SimpleNamespace(
@@ -477,6 +503,48 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertNotEqual(key_default, key_low)
         self.assertNotEqual(key_low, key_high)
         self.assertIn("budget=", key_low)
+
+    def test_force_refresh_bypasses_fundamental_cache(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_cache_max_entries=256,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        cache_key = manager._get_fundamental_cache_key("600519", 1.5)
+        cached_context = {"market": "cn", "status": "cached"}
+        manager._fundamental_cache[cache_key] = {
+            "ts": time.time(),
+            "context": cached_context,
+        }
+        fresh_bundle = {
+            "status": "partial",
+            "growth": {"revenue_yoy": 1.0},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=None), \
+                patch.object(
+                    manager._fundamental_adapter,
+                    "get_fundamental_bundle",
+                    return_value=fresh_bundle,
+                ) as bundle_mock:
+            context = manager.get_fundamental_context(
+                "600519",
+                budget_seconds=1.5,
+                force_refresh=True,
+            )
+
+        self.assertIsNot(context, cached_context)
+        self.assertEqual(context["growth"]["data"]["revenue_yoy"], 1.0)
+        bundle_mock.assert_called_once_with("600519")
 
     def test_board_context_empty_rankings_mark_failed(self) -> None:
         manager = DataFetcherManager(fetchers=[])

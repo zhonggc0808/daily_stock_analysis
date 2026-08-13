@@ -192,6 +192,39 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
             current_time=frozen_time,
         )
 
+    def test_process_single_stock_propagates_force_refresh(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.query_id = None
+        pipeline._emit_progress = MagicMock()
+        pipeline._resolve_resume_target_date = MagicMock(return_value=date(2026, 3, 26))
+        pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
+        pipeline.analyze_stock = MagicMock(
+            return_value=SimpleNamespace(
+                success=True,
+                operation_advice="持有",
+                sentiment_score=60,
+            )
+        )
+
+        pipeline.process_single_stock(
+            "600519",
+            report_type=ReportType.SIMPLE,
+            analysis_query_id="q-force-refresh",
+            force_refresh=True,
+        )
+
+        pipeline.fetch_and_save_stock_data.assert_called_once_with(
+            "600519",
+            current_time=None,
+            force_refresh=True,
+        )
+        pipeline.analyze_stock.assert_called_once_with(
+            "600519",
+            ReportType.SIMPLE,
+            query_id="q-force-refresh",
+            force_refresh=True,
+        )
+
     def test_legacy_analysis_artifacts_helper_maps_full_pipeline_fields(self):
         pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
         pipeline.query_source = "api"

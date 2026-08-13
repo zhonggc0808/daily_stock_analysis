@@ -992,6 +992,9 @@ class Config:
     news_intel_fetch_timeout_sec: float = 8.0  # 单个资讯源拉取超时
     news_intel_max_items_per_source: int = 50  # 单次每个资讯源最多采集条数
     news_intel_auto_fetch_enabled: bool = False  # 是否在分析前自动初始化并拉取本地资讯源
+    news_intel_cache_ttl_seconds: int = 300  # 多维度新闻搜索进程级缓存
+    search_provider_cooldown_seconds: int = 1800  # 搜索源限流/拒绝后的冷却时间
+    news_search_max_concurrency: int = 3  # 单股新闻维度最大并发
     newsnow_base_url: str = "https://newsnow.busiyi.world"  # NewsNow HTTP API base URL (数据源侧，不影响 LLM/provider base URL)
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
@@ -1215,8 +1218,17 @@ class Config:
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
     realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
+    # A 股日线专用数据源顺序，不影响港股/美股等市场路由
+    cn_daily_source_priority: str = "tencent,efinance,akshare,pytdx,baostock,yfinance"
     # 实时行情缓存时间（秒）
-    realtime_cache_ttl: int = 600
+    realtime_cache_ttl: int = 30
+    realtime_closed_cache_ttl: int = 300
+    chip_cache_ttl_seconds: int = 1800
+    chip_failure_cache_ttl_seconds: int = 600
+    market_structure_cache_ttl_seconds: int = 1800
+    analysis_parallel_io_enabled: bool = True
+    analysis_io_max_concurrency: int = 3
+    analysis_global_io_limit: int = 6
     # 熔断器冷却时间（秒）
     circuit_breaker_cooldown: int = 300
 
@@ -1230,7 +1242,7 @@ class Config:
     # 单能力失败重试次数（已包含首次）
     fundamental_retry_max: int = 1
     # 基本面上下文短 TTL（秒）
-    fundamental_cache_ttl_seconds: int = 120
+    fundamental_cache_ttl_seconds: int = 1800
     # 基本面缓存最大条目数（避免长时间运行内存增长）
     fundamental_cache_max_entries: int = 256
 
@@ -1898,6 +1910,18 @@ class Config:
                 os.getenv('NEWS_INTEL_AUTO_FETCH_ENABLED'),
                 False,
             ),
+            news_intel_cache_ttl_seconds=parse_env_int(
+                os.getenv('NEWS_INTEL_CACHE_TTL_SECONDS'), 300,
+                field_name='NEWS_INTEL_CACHE_TTL_SECONDS', minimum=0,
+            ),
+            search_provider_cooldown_seconds=parse_env_int(
+                os.getenv('SEARCH_PROVIDER_COOLDOWN_SECONDS'), 1800,
+                field_name='SEARCH_PROVIDER_COOLDOWN_SECONDS', minimum=0,
+            ),
+            news_search_max_concurrency=parse_env_int(
+                os.getenv('NEWS_SEARCH_MAX_CONCURRENCY'), 3,
+                field_name='NEWS_SEARCH_MAX_CONCURRENCY', minimum=1,
+            ),
             newsnow_base_url=((os.getenv('NEWSNOW_BASE_URL') or '').strip().rstrip('/') or 'https://newsnow.busiyi.world'),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             agent_backend=(os.getenv('AGENT_BACKEND', 'auto') or 'auto').strip().lower(),
@@ -2198,7 +2222,38 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
-            realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
+            cn_daily_source_priority=os.getenv(
+                'CN_DAILY_SOURCE_PRIORITY',
+                'tencent,efinance,akshare,pytdx,baostock,yfinance',
+            ),
+            realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 30, field_name='REALTIME_CACHE_TTL', minimum=0),
+            realtime_closed_cache_ttl=parse_env_int(
+                os.getenv('REALTIME_CLOSED_CACHE_TTL'), 300,
+                field_name='REALTIME_CLOSED_CACHE_TTL', minimum=0,
+            ),
+            chip_cache_ttl_seconds=parse_env_int(
+                os.getenv('CHIP_CACHE_TTL_SECONDS'), 1800,
+                field_name='CHIP_CACHE_TTL_SECONDS', minimum=0,
+            ),
+            chip_failure_cache_ttl_seconds=parse_env_int(
+                os.getenv('CHIP_FAILURE_CACHE_TTL_SECONDS'), 600,
+                field_name='CHIP_FAILURE_CACHE_TTL_SECONDS', minimum=0,
+            ),
+            market_structure_cache_ttl_seconds=parse_env_int(
+                os.getenv('MARKET_STRUCTURE_CACHE_TTL_SECONDS'), 1800,
+                field_name='MARKET_STRUCTURE_CACHE_TTL_SECONDS', minimum=0,
+            ),
+            analysis_parallel_io_enabled=parse_env_bool(
+                os.getenv('ANALYSIS_PARALLEL_IO_ENABLED'), True,
+            ),
+            analysis_io_max_concurrency=parse_env_int(
+                os.getenv('ANALYSIS_IO_MAX_CONCURRENCY'), 3,
+                field_name='ANALYSIS_IO_MAX_CONCURRENCY', minimum=1,
+            ),
+            analysis_global_io_limit=parse_env_int(
+                os.getenv('ANALYSIS_GLOBAL_IO_LIMIT'), 6,
+                field_name='ANALYSIS_GLOBAL_IO_LIMIT', minimum=1,
+            ),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
             fundamental_stage_timeout_seconds=parse_env_float(
@@ -2216,7 +2271,7 @@ class Config:
             fundamental_retry_max=parse_env_int(os.getenv('FUNDAMENTAL_RETRY_MAX'), 1, field_name='FUNDAMENTAL_RETRY_MAX', minimum=0),
             fundamental_cache_ttl_seconds=parse_env_int(
                 os.getenv('FUNDAMENTAL_CACHE_TTL_SECONDS'),
-                120,
+                1800,
                 field_name='FUNDAMENTAL_CACHE_TTL_SECONDS',
                 minimum=0,
             ),

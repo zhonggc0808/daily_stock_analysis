@@ -2885,9 +2885,38 @@ describe('HomePage', () => {
     expect(analysisApi.analyzeAsync).toHaveBeenCalledWith(expect.objectContaining({
       stockCode: '600519',
       originalQuery: '600519',
-      forceRefresh: true,
+      forceRefresh: false,
     }));
     expect(vi.mocked(analysisApi.analyzeAsync).mock.calls[0]?.[0]).not.toHaveProperty('reportLanguage');
+
+  });
+
+  it('supports an explicit force-refresh reanalysis command', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [historyItem],
+    });
+    vi.mocked(historyApi.getDetail).mockResolvedValue(historyReport);
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      taskId: 'task-force-re-1',
+      status: 'pending',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('趋势维持强势');
+    fireEvent.click(screen.getByRole('button', { name: '强制刷新数据并重新分析' }));
+
+    expect(analysisApi.analyzeAsync).toHaveBeenCalledWith(expect.objectContaining({
+      stockCode: '600519',
+      forceRefresh: true,
+    }));
   });
 
   it('passes the selected strategy when submitting stock analysis', async () => {
