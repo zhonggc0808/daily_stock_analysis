@@ -42,7 +42,7 @@ cp .env.example .env
 vim .env  # 填入真实的 API Key 等配置
 ```
 
-Compose 启动时从仓库根目录 `.env` 注入环境变量；Web 设置页保存的运行时配置写入宿主机 `data/runtime.env`（容器内 `/app/data/runtime.env`），容器重建后仍会保留。启动环境中的同名变量优先级更高，因此需要持久修改这类变量时也应同步更新根目录 `.env`。
+Compose 启动时从仓库根目录 `.env` 注入环境变量；Web 设置页保存的运行时配置写入宿主机 `data/runtime.env`（容器内 `/app/data/runtime.env`），容器重建后仍会保留。通常启动环境中的同名变量优先级更高，因此需要持久修改这类变量时也应同步更新根目录 `.env`。`SCREENING_ENABLED` 是例外：运行配置中已有该键时优先使用运行配置，确保 Web 选股开关可跨容器重建保持。
 
 ### 3. 一键启动
 

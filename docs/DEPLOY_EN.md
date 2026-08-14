@@ -42,7 +42,7 @@ cp .env.example .env
 vim .env  # Fill in real API Keys and configuration
 ```
 
-Compose injects startup environment variables from the repository-root `.env`. Runtime settings saved from the Web UI are written to host file `data/runtime.env` (container path `/app/data/runtime.env`) and survive container recreation. Same-name variables injected at startup take precedence, so update the root `.env` as well when such a value must persist across restarts.
+Compose injects startup environment variables from the repository-root `.env`. Runtime settings saved from the Web UI are written to host file `data/runtime.env` (container path `/app/data/runtime.env`) and survive container recreation. Same-name variables injected at startup normally take precedence, so update the root `.env` as well when such a value must persist across restarts. `SCREENING_ENABLED` is the exception: once present in the runtime file, that persisted value wins so the Web screening toggle survives container recreation.
 
 ### 3. One-Click Start
 

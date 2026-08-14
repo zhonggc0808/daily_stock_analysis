@@ -617,7 +617,7 @@ services:
 
 默认 Compose 和 `docker run` 示例仅使用 `env_file` / `--env-file` 注入启动配置，不再把宿主机 `.env` 单文件挂载进容器。WebUI 设置页会在当前活跃 `.env` 文件缺少某些键时展示启动注入的同名环境变量作为兜底，避免 Docker 用户误以为配置完全未读取；但“导出 `.env`”仍只导出当前活跃配置文件内容。
 
-默认 Compose 从仓库根目录 `.env` 注入启动环境变量，并将 `ENV_FILE` 指向数据卷中的 `/app/data/runtime.env`，因此 WebUI 保存的运行时配置会持久化到宿主机 `data/runtime.env`，容器重建后仍保留。不要使用 `.env` 单文件 bind mount。注意：启动时的 `env_file`、`--env-file`、`docker run -e` 或 Compose `environment:` 中的同名变量优先级更高；需要让 WebUI 保存值生效时，请同步更新或移除启动环境中的同名覆盖。
+默认 Compose 从仓库根目录 `.env` 注入启动环境变量，并将 `ENV_FILE` 指向数据卷中的 `/app/data/runtime.env`，因此 WebUI 保存的运行时配置会持久化到宿主机 `data/runtime.env`，容器重建后仍保留。不要使用 `.env` 单文件 bind mount。通常启动时的 `env_file`、`--env-file`、`docker run -e` 或 Compose `environment:` 中的同名变量优先级更高；需要让 WebUI 保存值生效时，请同步更新或移除启动环境中的同名覆盖。`SCREENING_ENABLED` 是例外：运行配置中已有该键时优先使用运行配置，使 Web 选股开关在容器重建后保持不变。
 
 推荐同时映射这几个目录：
 

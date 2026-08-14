@@ -813,6 +813,61 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.stock_list, ["600519", "000001"])
 
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_screening_toggle_prefers_persisted_runtime_value_after_container_recreation(
+        self,
+        _mock_parse_yaml,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / "runtime.env"
+            env_path.write_text("SCREENING_ENABLED=true\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(env_path),
+                    "SCREENING_ENABLED": "false",
+                },
+                clear=True,
+            ):
+                enabled = Config._load_from_env()
+
+            Config.reset_instance()
+            env_path.write_text("SCREENING_ENABLED=false\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(env_path),
+                    "SCREENING_ENABLED": "true",
+                },
+                clear=True,
+            ):
+                disabled = Config._load_from_env()
+
+        self.assertTrue(enabled.screening_enabled)
+        self.assertFalse(disabled.screening_enabled)
+
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_screening_toggle_uses_process_env_when_runtime_file_has_no_value(
+        self,
+        _mock_parse_yaml,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / "runtime.env"
+            env_path.write_text("LOG_LEVEL=INFO\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(env_path),
+                    "SCREENING_ENABLED": "true",
+                },
+                clear=True,
+            ):
+                config = Config._load_from_env()
+
+        self.assertTrue(config.screening_enabled)
+
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_custom_webhook_template_unescapes_compose_saved_placeholders(
         self,
         _mock_parse_yaml,

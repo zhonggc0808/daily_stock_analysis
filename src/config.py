@@ -1322,6 +1322,10 @@ class Config:
             "SCHEDULE_RUN_IMMEDIATELY",
         }
     )
+    # Feature toggles changed from the Web UI must survive container recreation.
+    # Compose injects the repository .env at startup, so these persisted values
+    # intentionally override same-name startup values once present in ENV_FILE.
+    _WEBUI_PERSISTED_ENV_FILE_AUTHORITY_KEYS = frozenset({"SCREENING_ENABLED"})
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
     _BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset()
@@ -2321,7 +2325,10 @@ class Config:
                 minimum=1,
             ),
             portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true',
-            screening_enabled=parse_env_bool(os.getenv('SCREENING_ENABLED'), default=False),
+            screening_enabled=parse_env_bool(
+                cls._resolve_env_value('SCREENING_ENABLED', default='false'),
+                default=False,
+            ),
         )
     
     @classmethod
@@ -2822,9 +2829,18 @@ class Config:
         env_value = os.getenv(key)
         file_value = cls._get_env_file_value(key)
 
-        should_prefer_file = prefer_env_file or key in cls._WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS
+        persisted_file_is_authoritative = key in cls._WEBUI_PERSISTED_ENV_FILE_AUTHORITY_KEYS
+        should_prefer_file = (
+            prefer_env_file
+            or key in cls._WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS
+            or persisted_file_is_authoritative
+        )
         if should_prefer_file and file_value is not None:
-            if env_value is not None and cls._has_bootstrap_runtime_env_override(key):
+            if (
+                not persisted_file_is_authoritative
+                and env_value is not None
+                and cls._has_bootstrap_runtime_env_override(key)
+            ):
                 return env_value
             return file_value
         if env_value is not None:
