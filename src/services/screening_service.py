@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from src.config import Config, get_configured_llm_models, normalize_llm_channel_api_surface
 from src.services.screening import REFERENCE_PROJECT, REFERENCE_REVISION, __version__ as SCREENING_VERSION
+from src.services.screening.concurrency import iter_completed_with_cancellation
 from src.services.screening import hotspot as screening_hotspot
 from src.services.screening.config import Config as ScreeningPipelineConfig
 from src.services.screening.pipeline import screen as run_screening_pipeline
@@ -1276,7 +1277,10 @@ class ScreeningService:
                 "正在补充入选股票的新闻与事件",
             )
             _check_screening_cancelled(cancellation_check)
-            selected, dsa_enrichment = _enrich_candidates_with_dsa(selected)
+            selected, dsa_enrichment = _enrich_candidates_with_dsa(
+                selected,
+                cancellation_check=cancellation_check,
+            )
             _check_screening_cancelled(cancellation_check)
         warnings = _collect_screening_warning_messages(raw_data)
         response = {
@@ -3529,7 +3533,12 @@ def get_dsa_candidate_context(
     return context.get("dsa_context", {})
 
 
-def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _enrich_candidates_with_dsa(
+    candidates: List[Dict[str, Any]],
+    *,
+    cancellation_check: Callable[[], None] | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    _check_screening_cancelled(cancellation_check)
     enriched_count = 0
     warnings: List[str] = []
     limit = min(len(candidates), DSA_ENRICHMENT_MAX_CANDIDATES)
@@ -3540,6 +3549,7 @@ def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[
     reused_indices: set[int] = set()
 
     def enrich_one(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        _check_screening_cancelled(cancellation_check)
         working_candidate = dict(candidate)
         enriched = _build_dsa_candidate_context(
             working_candidate,
@@ -3550,10 +3560,12 @@ def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[
         for field in ("name", "price", "change_pct", "amount"):
             if working_candidate.get(field) not in (None, ""):
                 enriched[field] = working_candidate[field]
+        _check_screening_cancelled(cancellation_check)
         return enriched
 
     pending_indices = []
     for index, candidate in enumerate(candidates[:limit]):
+        _check_screening_cancelled(cancellation_check)
         existing_context = candidate.get("dsa_context")
         if (
             isinstance(existing_context, dict)
@@ -3569,24 +3581,36 @@ def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[
         try:
             enrich_results[index] = (enrich_one(candidates[index]), None)
         except Exception as exc:  # noqa: BLE001
+            _check_screening_cancelled(cancellation_check)
             enrich_results[index] = (None, exc)
     elif pending_indices:
         worker_count = min(3, len(pending_indices))
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="screening-dsa") as executor:
-            futures = {}
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="screening-dsa")
+        futures = {}
+        try:
             for index in pending_indices:
+                _check_screening_cancelled(cancellation_check)
                 thread_context = contextvars.copy_context()
                 futures[
                     executor.submit(thread_context.run, enrich_one, candidates[index])
                 ] = index
-            for future in as_completed(futures):
+            for future in iter_completed_with_cancellation(futures, cancellation_check):
                 index = futures[future]
                 try:
                     enrich_results[index] = (future.result(), None)
                 except Exception as exc:  # noqa: BLE001
+                    _check_screening_cancelled(cancellation_check)
                     enrich_results[index] = (None, exc)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     for index, candidate in enumerate(candidates[:limit]):
+        _check_screening_cancelled(cancellation_check)
         enriched, error = enrich_results[index]
         existing_context = candidate.get("dsa_context")
         if index in reused_indices:

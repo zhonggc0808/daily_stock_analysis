@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import contextvars
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from src.services.screening.concurrency import iter_completed_with_cancellation
 from src.services.screening.models import Pick
 
 logger = logging.getLogger(__name__)
@@ -28,8 +29,10 @@ def apply_dsa_provider_context(
     context: dict[str, Any] | None,
     *,
     max_candidates: int | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> list[str]:
     """Attach DSA context to top candidates before LLM ranking."""
+    _check_cancelled(cancellation_check)
     provider = _extract_provider_context(context)
     if not picks or not provider:
         return []
@@ -43,30 +46,45 @@ def apply_dsa_provider_context(
     fetch_errors: list[Exception | None] = [None] * limit
 
     def fetch_one(pick: Pick) -> dict[str, Any]:
-        return _fetch_candidate_context(provider, pick)
+        _check_cancelled(cancellation_check)
+        payload = _fetch_candidate_context(provider, pick)
+        _check_cancelled(cancellation_check)
+        return payload
 
     worker_count = min(DSA_PROVIDER_MAX_WORKERS, limit)
     if worker_count <= 1:
         try:
             payloads[0] = fetch_one(targets[0])
         except Exception as exc:  # noqa: BLE001
+            _check_cancelled(cancellation_check)
             fetch_errors[0] = exc
     else:
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="screening-dsa") as executor:
-            futures = {}
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="screening-dsa")
+        futures = {}
+        try:
             for index, pick in enumerate(targets):
+                _check_cancelled(cancellation_check)
                 thread_context = contextvars.copy_context()
                 futures[executor.submit(thread_context.run, fetch_one, pick)] = index
-            for future in as_completed(futures):
+            for future in iter_completed_with_cancellation(futures, cancellation_check):
                 index = futures[future]
                 try:
                     payloads[index] = future.result()
                 except Exception as exc:  # noqa: BLE001
+                    _check_cancelled(cancellation_check)
                     fetch_errors[index] = exc
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     enriched_count = 0
     errors: list[str] = []
     for index, pick in enumerate(targets):
+        _check_cancelled(cancellation_check)
         try:
             fetch_error = fetch_errors[index]
             if fetch_error is not None:
@@ -97,6 +115,11 @@ def apply_dsa_provider_context(
         suffix = f" | +{len(errors) - 5} more" if len(errors) > 5 else ""
         notes.append(f"DSA provider context row errors: {sample}{suffix}")
     return notes
+
+
+def _check_cancelled(cancellation_check: Callable[[], None] | None) -> None:
+    if cancellation_check is not None:
+        cancellation_check()
 
 
 def _resolve_max_candidates(provider: dict[str, Any], max_candidates: int | None) -> int:

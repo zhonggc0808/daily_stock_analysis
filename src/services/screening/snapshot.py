@@ -7,15 +7,17 @@ Fetches full-market real-time snapshots for screening.
 This is separate from single-stock realtime quotes.
 """
 
+import copy
 import logging
 import json
 import os
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import requests
@@ -38,6 +40,9 @@ _EM_LAST_REQUEST_AT = 0.0
 _EM_LOCK = threading.Lock()
 _SOURCE_HEALTH: dict[str, dict[str, object]] = {}
 _SOURCE_HEALTH_LOCK = threading.Lock()
+_SNAPSHOT_INFLIGHT: dict[tuple[object, ...], Future[pd.DataFrame]] = {}
+_SNAPSHOT_INFLIGHT_LOCK = threading.Lock()
+_SNAPSHOT_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="screening-snapshot")
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -64,6 +69,92 @@ def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
 
 
 def fetch_snapshot_with_fallback(
+    sources: list[str],
+    *,
+    required_columns: list[str] | None = None,
+    fallback_snapshot_path: str | Path | None = None,
+    fallback_max_age_hours: float | None = None,
+    cache_ttl_seconds: float = 0.0,
+    market: str = "cn",
+    cancellation_check: Callable[[], None] | None = None,
+) -> pd.DataFrame:
+    """Coalesce identical in-flight snapshot requests and return an isolated copy."""
+    _check_cancelled(cancellation_check)
+    key = _snapshot_singleflight_key(
+        market=market,
+        sources=sources,
+        required_columns=required_columns,
+        fallback_snapshot_path=fallback_snapshot_path,
+        fallback_max_age_hours=fallback_max_age_hours,
+        cache_ttl_seconds=cache_ttl_seconds,
+    )
+    owner = False
+    with _SNAPSHOT_INFLIGHT_LOCK:
+        future = _SNAPSHOT_INFLIGHT.get(key)
+        if future is None:
+            future = Future()
+            _SNAPSHOT_INFLIGHT[key] = future
+            owner = True
+
+    if owner:
+        try:
+            _SNAPSHOT_EXECUTOR.submit(
+                _produce_snapshot,
+                key,
+                future,
+                list(sources),
+                required_columns=list(required_columns) if required_columns is not None else None,
+                fallback_snapshot_path=fallback_snapshot_path,
+                fallback_max_age_hours=fallback_max_age_hours,
+                cache_ttl_seconds=cache_ttl_seconds,
+                market=market,
+            )
+        except BaseException as exc:
+            _remove_inflight_snapshot(key, future)
+            future.set_exception(exc)
+
+    result = _wait_for_snapshot(future, cancellation_check)
+    return _copy_snapshot_result(result, shared=not owner)
+
+
+def _produce_snapshot(
+    key: tuple[object, ...],
+    future: Future[pd.DataFrame],
+    sources: list[str],
+    *,
+    required_columns: list[str] | None,
+    fallback_snapshot_path: str | Path | None,
+    fallback_max_age_hours: float | None,
+    cache_ttl_seconds: float,
+    market: str,
+) -> None:
+    try:
+        result = _fetch_snapshot_with_fallback_uncached(
+            sources,
+            required_columns=required_columns,
+            fallback_snapshot_path=fallback_snapshot_path,
+            fallback_max_age_hours=fallback_max_age_hours,
+            cache_ttl_seconds=cache_ttl_seconds,
+            market=market,
+        )
+    except BaseException as exc:
+        _remove_inflight_snapshot(key, future)
+        future.set_exception(exc)
+    else:
+        _remove_inflight_snapshot(key, future)
+        future.set_result(result)
+
+
+def _remove_inflight_snapshot(
+    key: tuple[object, ...],
+    future: Future[pd.DataFrame],
+) -> None:
+    with _SNAPSHOT_INFLIGHT_LOCK:
+        if _SNAPSHOT_INFLIGHT.get(key) is future:
+            _SNAPSHOT_INFLIGHT.pop(key, None)
+
+
+def _fetch_snapshot_with_fallback_uncached(
     sources: list[str],
     *,
     required_columns: list[str] | None = None,
@@ -149,6 +240,50 @@ def fetch_snapshot_with_fallback(
         return cached
 
     raise RuntimeError(f"All snapshot sources failed: {'; '.join(errors)}")
+
+
+def _snapshot_singleflight_key(
+    *,
+    market: str,
+    sources: list[str],
+    required_columns: list[str] | None,
+    fallback_snapshot_path: str | Path | None,
+    fallback_max_age_hours: float | None,
+    cache_ttl_seconds: float,
+) -> tuple[object, ...]:
+    return (
+        str(market or "cn"),
+        tuple(str(source) for source in sources),
+        tuple(sorted(str(column) for column in (required_columns or []))),
+        str(Path(fallback_snapshot_path).absolute()) if fallback_snapshot_path is not None else None,
+        fallback_max_age_hours,
+        float(cache_ttl_seconds or 0.0),
+    )
+
+
+def _wait_for_snapshot(
+    future: Future[pd.DataFrame],
+    cancellation_check: Callable[[], None] | None,
+) -> pd.DataFrame:
+    while True:
+        _check_cancelled(cancellation_check)
+        try:
+            return future.result(timeout=0.1)
+        except FutureTimeoutError:
+            continue
+
+
+def _copy_snapshot_result(df: pd.DataFrame, *, shared: bool) -> pd.DataFrame:
+    copied = df.copy(deep=True)
+    copied.attrs = copy.deepcopy(df.attrs)
+    copied.attrs["snapshot_singleflight_shared"] = shared
+    copied.attrs["snapshot_cache_hit"] = bool(copied.attrs.get("cache_used", False))
+    return copied
+
+
+def _check_cancelled(cancellation_check: Callable[[], None] | None) -> None:
+    if cancellation_check is not None:
+        cancellation_check()
 
 
 def _fetch_us_snapshot_with_fallback(

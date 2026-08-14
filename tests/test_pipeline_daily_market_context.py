@@ -306,6 +306,7 @@ def test_pipeline_uses_market_phase_effective_date_for_daily_market_context() ->
 
     pipeline._load_daily_market_context.assert_called_once_with(
         "cn",
+        force_refresh=False,
         target_date=date(2026, 3, 26),
     )
 

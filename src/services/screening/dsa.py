@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 from urllib.parse import urlparse
 
 import requests
 
+from src.services.screening.concurrency import iter_completed_with_cancellation
 from src.services.screening.models import Pick
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ def analyze_picks_with_dsa(
     timeout_sec: float = 120.0,
     force_refresh: bool = False,
     notify: bool = False,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[list[Pick], list[str]]:
     """Run DSA deep analysis for up to ``max_picks`` candidates in place.
 
@@ -54,6 +57,7 @@ def analyze_picks_with_dsa(
     """
     if not api_url:
         raise ValueError("DSA_API_URL is required when deep_analysis=True")
+    _check_cancelled(cancellation_check)
     if max_picks <= 0:
         return picks, []
 
@@ -62,6 +66,7 @@ def analyze_picks_with_dsa(
     endpoint = build_dsa_analyze_url(api_url)
 
     def _analyze_one(idx: int, pick: Pick) -> tuple[int, Pick, bool, dict, str]:
+        _check_cancelled(cancellation_check)
         try:
             result = call_dsa_analysis(
                 endpoint,
@@ -73,25 +78,36 @@ def analyze_picks_with_dsa(
                 force_refresh=force_refresh,
                 notify=notify,
             )
-            return idx, pick, True, result, ""
         except Exception as exc:  # noqa: BLE001 - external DSA analysis is best-effort.
+            _check_cancelled(cancellation_check)
             return idx, pick, False, {}, str(exc)
+        _check_cancelled(cancellation_check)
+        return idx, pick, True, result, ""
 
     targeted = picks[:analyze_count]
     # Candidates are analyzed concurrently so deep-analysis latency does not
     # scale linearly with the candidate count. Each candidate mutates its own
     # Pick object, so the parallel writes are isolated per candidate.
     outcomes: dict[int, tuple[Pick, bool, dict, str]] = {}
-    with ThreadPoolExecutor(max_workers=min(3, analyze_count)) as executor:
-        futures = [
-            executor.submit(_analyze_one, idx, pick)
-            for idx, pick in enumerate(targeted)
-        ]
-        for future in as_completed(futures):
+    executor = ThreadPoolExecutor(max_workers=min(3, analyze_count))
+    futures = []
+    try:
+        for idx, pick in enumerate(targeted):
+            _check_cancelled(cancellation_check)
+            futures.append(executor.submit(_analyze_one, idx, pick))
+        for future in iter_completed_with_cancellation(futures, cancellation_check):
             idx, pick, ok, result, error = future.result()
             outcomes[idx] = (pick, ok, result, error)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     for idx in sorted(outcomes):
+        _check_cancelled(cancellation_check)
         pick, ok, result, error = outcomes[idx]
         if ok:
             pick.deep_analysis_status = "completed"
@@ -106,6 +122,11 @@ def analyze_picks_with_dsa(
             degradation.append(f"DSA deep analysis failed for {pick.code}: {error}")
 
     return picks, degradation
+
+
+def _check_cancelled(cancellation_check: Callable[[], None] | None) -> None:
+    if cancellation_check is not None:
+        cancellation_check()
 
 
 def build_dsa_analyze_url(api_url: str) -> str:

@@ -3,6 +3,8 @@
 
 import os
 import sys
+import threading
+import time
 import unittest
 from datetime import date, datetime
 from types import SimpleNamespace
@@ -109,6 +111,100 @@ def _make_pipeline(*, agent_mode: bool = False, save_context_snapshot: bool = Tr
 
 
 class PipelineMarketPhaseContextTestCase(unittest.TestCase):
+    def test_secondary_analysis_io_overlaps_fundamentals_and_local_intelligence(self):
+        pipeline = _make_pipeline()
+        pipeline.config.analysis_parallel_io_enabled = True
+        pipeline.config.analysis_io_max_concurrency = 2
+        fundamental_started = threading.Event()
+        intelligence_started = threading.Event()
+
+        def fetch_fundamental(*_args, **_kwargs):
+            fundamental_started.set()
+            self.assertTrue(intelligence_started.wait(timeout=1))
+            return {"market": "cn", "coverage": {"boards": "not_supported"}, "source_chain": []}
+
+        def load_intelligence(**_kwargs):
+            intelligence_started.set()
+            self.assertTrue(fundamental_started.wait(timeout=1))
+            return "persisted intelligence"
+
+        pipeline.fetcher_manager.get_fundamental_context.side_effect = fetch_fundamental
+        pipeline._load_persisted_intelligence_context = load_intelligence
+
+        result = pipeline.analyze_stock(
+            "600519",
+            ReportType.SIMPLE,
+            "q-parallel-secondary",
+            current_time=datetime(2026, 3, 27, 10, 0),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(fundamental_started.is_set())
+        self.assertTrue(intelligence_started.is_set())
+
+    def test_secondary_analysis_io_remains_serial_when_parallel_io_is_disabled(self):
+        pipeline = _make_pipeline()
+        pipeline.config.analysis_parallel_io_enabled = False
+        active = 0
+        peak_active = 0
+        order: list[str] = []
+        lock = threading.Lock()
+
+        def enter(name: str):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                order.append(name)
+            time.sleep(0.01)
+            with lock:
+                active -= 1
+
+        def fetch_fundamental(*_args, **_kwargs):
+            enter("fundamental")
+            return {"market": "cn", "coverage": {"boards": "not_supported"}, "source_chain": []}
+
+        def load_intelligence(**_kwargs):
+            enter("local_intelligence")
+            return None
+
+        pipeline.fetcher_manager.get_fundamental_context.side_effect = fetch_fundamental
+        pipeline._load_persisted_intelligence_context = load_intelligence
+
+        result = pipeline.analyze_stock(
+            "600519",
+            ReportType.SIMPLE,
+            "q-serial-secondary",
+            current_time=datetime(2026, 3, 27, 10, 0),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(order, ["fundamental", "local_intelligence"])
+        self.assertEqual(peak_active, 1)
+
+    def test_secondary_analysis_io_isolates_local_intelligence_failure(self):
+        pipeline = _make_pipeline()
+        pipeline.config.analysis_parallel_io_enabled = True
+        pipeline.config.analysis_io_max_concurrency = 2
+        fundamental = {"market": "cn", "coverage": {"boards": "not_supported"}, "source_chain": []}
+        pipeline.fetcher_manager.get_fundamental_context.return_value = fundamental
+        pipeline._load_persisted_intelligence_context = MagicMock(
+            side_effect=RuntimeError("local intelligence unavailable")
+        )
+
+        result = pipeline.analyze_stock(
+            "600519",
+            ReportType.SIMPLE,
+            "q-secondary-failure",
+            current_time=datetime(2026, 3, 27, 10, 0),
+        )
+
+        self.assertIsNotNone(result)
+        pipeline.db.save_fundamental_snapshot.assert_called_once()
+        saved_payload = pipeline.db.save_fundamental_snapshot.call_args.kwargs["payload"]
+        self.assertEqual(saved_payload["market"], fundamental["market"])
+        self.assertEqual(saved_payload["coverage"], fundamental["coverage"])
+
     def test_jp_kr_analysis_context_uses_daily_fetcher_when_db_context_missing(self):
         pipeline = _make_pipeline()
         pipeline.db.get_analysis_context.side_effect = [None, None]
@@ -755,7 +851,10 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
             self.assertIsNotNone(diagnostics)
             self.assertEqual(diagnostics["trace_id"], "trace-agent")
             self.assertEqual(diagnostics["query_id"], "q-agent")
-            self.assertEqual(diagnostics["provider_runs"], [])
+            self.assertEqual(
+                [run["operation"] for run in diagnostics["provider_runs"]],
+                ["llm"],
+            )
             # history_runs will be populated after save_analysis_history callback, so compare core fields only
             current_snapshot = current_diagnostic_snapshot()
             self.assertEqual(current_snapshot["trace_id"], diagnostics["trace_id"])

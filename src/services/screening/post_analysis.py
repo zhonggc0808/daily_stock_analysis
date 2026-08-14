@@ -10,6 +10,7 @@ external HTTP scoring tool without making DSA part of the core selection path.
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Callable
 
 import requests
 
@@ -90,6 +91,7 @@ def run_post_analyzers(
     config: Config,
     max_picks: int | None = None,
     scorecard_profile: dict[str, object] | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[list[Pick], list[str]]:
     """Run selected post analyzers and re-rank by final_score.
 
@@ -106,21 +108,36 @@ def run_post_analyzers(
     result = picks
 
     for analyzer in analyzer_names:
+        _check_cancelled(cancellation_check)
         if analyzer == "dsa":
             max_count = max_picks or config.post_analysis_max_picks
-            result, messages = _run_dsa_analyzer(result, run_id=run_id, config=config, max_picks=max_count)
+            result, messages = _run_dsa_analyzer(
+                result,
+                run_id=run_id,
+                config=config,
+                max_picks=max_count,
+                cancellation_check=cancellation_check,
+            )
         elif analyzer == "scorecard":
             result, messages = _run_scorecard_analyzer(
                 result,
                 max_picks=len(result),
                 profile=scorecard_profile,
+                cancellation_check=cancellation_check,
             )
         elif analyzer == "external_http":
             max_count = max_picks or config.post_analysis_max_picks
-            result, messages = _run_external_http_analyzer(result, run_id=run_id, config=config, max_picks=max_count)
+            result, messages = _run_external_http_analyzer(
+                result,
+                run_id=run_id,
+                config=config,
+                max_picks=max_count,
+                cancellation_check=cancellation_check,
+            )
         else:
             messages = [f"Unknown post analyzer skipped: {analyzer}"]
         degradation.extend(messages)
+        _check_cancelled(cancellation_check)
         # Every analyzer consumes the output of the previous one. Re-rank here,
         # rather than only after the whole chain, so a later capped remote
         # analyzer receives the candidates promoted by an earlier full-pool
@@ -137,6 +154,7 @@ def _run_dsa_analyzer(
     run_id: str,
     config: Config,
     max_picks: int,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[list[Pick], list[str]]:
     if not config.dsa_api_url:
         raise ValueError("post analyzer 'dsa' requested but DSA_API_URL is not configured")
@@ -153,6 +171,7 @@ def _run_dsa_analyzer(
         timeout_sec=config.dsa_timeout_sec,
         force_refresh=config.dsa_force_refresh,
         notify=config.dsa_notify,
+        cancellation_check=cancellation_check,
     )
     analyzed = apply_dsa_overlay(analyzed)
     for pick in analyzed:
@@ -184,8 +203,10 @@ def _run_scorecard_analyzer(
     *,
     max_picks: int,
     profile: dict[str, object] | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[list[Pick], list[str]]:
     for idx, pick in enumerate(picks):
+        _check_cancelled(cancellation_check)
         if idx >= max_picks:
             # Candidates beyond max_picks are explicitly marked as 'skipped'
             # so selection_variant can reliably exclude them from rotation.
@@ -213,6 +234,7 @@ def _run_external_http_analyzer(
     run_id: str,
     config: Config,
     max_picks: int,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[list[Pick], list[str]]:
     if not config.post_analyzer_url:
         raise ValueError("post analyzer 'external_http' requested but POST_ANALYZER_URL is not configured")
@@ -220,11 +242,13 @@ def _run_external_http_analyzer(
     attempted_count = min(max(int(max_picks), 0), len(picks))
     attempted_picks = picks[:attempted_count]
     candidates = [asdict(pick) for pick in attempted_picks]
+    _check_cancelled(cancellation_check)
     response = requests.post(
         config.post_analyzer_url,
         json={"run_id": run_id, "candidates": candidates},
         timeout=config.post_analyzer_timeout_sec,
     )
+    _check_cancelled(cancellation_check)
     response.raise_for_status()
     body = response.json()
     if isinstance(body, list):
@@ -242,6 +266,7 @@ def _run_external_http_analyzer(
     by_code = {_normalize_code(pick.code): pick for pick in attempted_picks}
     completed_codes: set[str] = set()
     for item in items:
+        _check_cancelled(cancellation_check)
         if not isinstance(item, dict):
             continue
         code = _normalize_code(item.get("code", ""))
@@ -284,6 +309,11 @@ def _run_external_http_analyzer(
     for pick in picks[attempted_count:]:
         _record_post_result(pick, "external_http", status="skipped", summary="", score_delta=0.0)
     return picks, []
+
+
+def _check_cancelled(cancellation_check: Callable[[], None] | None) -> None:
+    if cancellation_check is not None:
+        cancellation_check()
 
 
 def _scorecard_delta(

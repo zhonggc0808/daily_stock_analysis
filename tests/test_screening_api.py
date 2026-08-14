@@ -111,7 +111,7 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
             )
         with patch(
             "src.services.screening_service._enrich_candidates_with_dsa",
-            side_effect=lambda candidates: (
+            side_effect=lambda candidates, **_kwargs: (
                 candidates,
                 {
                     "enabled": True,
@@ -2750,6 +2750,72 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(peak_active, 3)
         self.assertEqual([item["code"] for item in enriched], ["000001", "000002", "000003"])
         self.assertEqual(metadata["enriched_count"], 3)
+
+    def test_post_rank_dsa_enrichment_propagates_cancellation(self) -> None:
+        cancelled = threading.Event()
+
+        def build_context(candidate, **_kwargs):
+            cancelled.set()
+            return {
+                "dsa_context": {"enriched": True},
+                "dsa_news": [{"title": candidate["code"]}],
+            }
+
+        def check_cancelled() -> None:
+            if cancelled.is_set():
+                raise RuntimeError("screening cancelled")
+
+        candidates = [{"code": code, "name": code} for code in ("000001", "000002", "000003")]
+        with patch(
+            "src.services.screening_service._build_dsa_candidate_context",
+            side_effect=build_context,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "screening cancelled"):
+                screening_service._enrich_candidates_with_dsa(
+                    candidates,
+                    cancellation_check=check_cancelled,
+                )
+
+    def test_post_rank_dsa_enrichment_cancels_while_calls_are_blocked(self) -> None:
+        candidates = [{"code": code, "name": code} for code in ("000001", "000002", "000003")]
+        all_started = threading.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+        lock = threading.Lock()
+        started_count = 0
+
+        def build_context(candidate, **_kwargs):
+            nonlocal started_count
+            with lock:
+                started_count += 1
+                if started_count == len(candidates):
+                    all_started.set()
+            self.assertTrue(release.wait(timeout=2))
+            return {
+                "dsa_context": {"enriched": True},
+                "dsa_news": [{"title": candidate["code"]}],
+            }
+
+        def check_cancelled() -> None:
+            if cancelled.is_set():
+                raise RuntimeError("screening cancelled")
+
+        with patch(
+            "src.services.screening_service._build_dsa_candidate_context",
+            side_effect=build_context,
+        ), ThreadPoolExecutor(max_workers=1) as executor:
+            call = executor.submit(
+                screening_service._enrich_candidates_with_dsa,
+                candidates,
+                cancellation_check=check_cancelled,
+            )
+            self.assertTrue(all_started.wait(timeout=1))
+            cancelled.set()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "screening cancelled"):
+                    call.result(timeout=1)
+            finally:
+                release.set()
 
     def test_screen_enriches_top_candidates_with_dsa_context(self) -> None:
         config = self._config(enabled=True)

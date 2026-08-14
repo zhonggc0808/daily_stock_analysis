@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ from src.services.screening.scorer import compute_screen_scores, factor_score_co
 from src.services.screening.selection_variant import apply_seeded_selection_variant
 from src.services.screening.snapshot import fetch_snapshot_with_fallback
 from src.services.screening.strategy import load_all_strategies
+from src.services.run_diagnostics import record_provider_run
 
 logger = logging.getLogger(__name__)
 
@@ -155,13 +157,28 @@ def screen(
 
     # 2. Fetch snapshot
     _emit_progress(progress_callback, 25, "正在读取全市场快照")
-    snapshot_df = fetch_snapshot_with_fallback(
-        config.snapshot_source_priority,
-        required_columns=_required_snapshot_columns(snapshot_filters),
-        fallback_snapshot_path=config.fallback_snapshot_path,
-        fallback_max_age_hours=config.snapshot_fallback_max_age_hours,
-        cache_ttl_seconds=config.snapshot_cache_ttl_seconds,
-        market=market,
+    snapshot_started_at = time.monotonic()
+    try:
+        snapshot_df = fetch_snapshot_with_fallback(
+            config.snapshot_source_priority,
+            required_columns=_required_snapshot_columns(snapshot_filters),
+            fallback_snapshot_path=config.fallback_snapshot_path,
+            fallback_max_age_hours=config.snapshot_fallback_max_age_hours,
+            cache_ttl_seconds=config.snapshot_cache_ttl_seconds,
+            market=market,
+            cancellation_check=cancellation_check,
+        )
+    except BaseException as exc:
+        _record_screening_stage("snapshot", snapshot_started_at, success=False, error=exc)
+        raise
+    _record_screening_stage(
+        "snapshot",
+        snapshot_started_at,
+        cache_hit=bool(
+            snapshot_df.attrs.get("snapshot_cache_hit", False)
+            or snapshot_df.attrs.get("snapshot_singleflight_shared", False)
+        ),
+        record_count=len(snapshot_df),
     )
     _check_cancelled(cancellation_check)
     effective_industry_map_files = (
@@ -258,6 +275,7 @@ def screen(
             )
         enrich_count = min(daily_limit, len(provisional))
         daily_candidates = provisional.head(enrich_count)
+        daily_started_at = time.monotonic()
         try:
             _emit_progress(
                 progress_callback,
@@ -342,12 +360,20 @@ def screen(
             else:
                 df = enriched
         except Exception as exc:
+            _record_screening_stage("daily_enrichment", daily_started_at, success=False, error=exc)
+            _check_cancelled(cancellation_check)
             if daily_needed:
                 raise RuntimeError(
                     "Daily K-line enrichment is required by this strategy but failed: "
                     f"{exc}"
                 ) from exc
             degradation.append(f"Daily K-line enrichment skipped: {exc}")
+        else:
+            _record_screening_stage(
+                "daily_enrichment",
+                daily_started_at,
+                record_count=daily_enrich_count,
+            )
 
     if df.empty:
         return ScreenResult(
@@ -399,7 +425,19 @@ def screen(
     _emit_progress(progress_callback, 52, "正在补充候选行情与基本面")
     _check_cancelled(cancellation_check)
     if profile.collect_company_context:
-        degradation.extend(apply_dsa_provider_context(picks, context))
+        dsa_context_started_at = time.monotonic()
+        try:
+            degradation.extend(
+                apply_dsa_provider_context(
+                    picks,
+                    context,
+                    cancellation_check=cancellation_check,
+                )
+            )
+        except BaseException as exc:
+            _record_screening_stage("dsa_context", dsa_context_started_at, success=False, error=exc)
+            raise
+        _record_screening_stage("dsa_context", dsa_context_started_at, record_count=len(picks))
     _check_cancelled(cancellation_check)
     llm_fallback_picks = [copy.deepcopy(pick) for pick in picks]
 
@@ -445,6 +483,7 @@ def screen(
                 cache_ttl_hours=config.llm_candidate_context_cache_ttl_hours,
                 source_weights=event_source_weights,
             )
+            _check_cancelled(cancellation_check)
             degradation.append(
                 f"Candidate context collected rows={len(candidate_context_rows)}"
             )
@@ -470,25 +509,37 @@ def screen(
         )
         degradation.extend(llm_context_degradation)
         llm_prompt_degradation: list[str] = []
-        llm_result = rank_candidates_with_metadata(
-            picks,
-            screening.ranking_hints,
-            config.llm_api_key,
-            config.llm_model,
-            config.llm_base_url,
-            context=effective_context,
-            rank_weight=config.llm_rank_weight,
-            max_retries=config.llm_max_retries,
-            min_coverage=config.llm_min_coverage,
-            fallback_models=config.llm_fallback_models,
-            temperature=config.llm_temperature,
-            json_mode=config.llm_json_mode,
-            silent=config.llm_silent,
-            channels=config.llm_channels,
-            config_path=str(config.llm_config_path or ""),
-            timeout_sec=config.llm_timeout_sec,
-            max_tokens=config.llm_max_tokens,
-            degradation=llm_prompt_degradation,
+        llm_started_at = time.monotonic()
+        try:
+            llm_result = rank_candidates_with_metadata(
+                picks,
+                screening.ranking_hints,
+                config.llm_api_key,
+                config.llm_model,
+                config.llm_base_url,
+                context=effective_context,
+                rank_weight=config.llm_rank_weight,
+                max_retries=config.llm_max_retries,
+                min_coverage=config.llm_min_coverage,
+                fallback_models=config.llm_fallback_models,
+                temperature=config.llm_temperature,
+                json_mode=config.llm_json_mode,
+                silent=config.llm_silent,
+                channels=config.llm_channels,
+                config_path=str(config.llm_config_path or ""),
+                timeout_sec=config.llm_timeout_sec,
+                max_tokens=config.llm_max_tokens,
+                degradation=llm_prompt_degradation,
+                cancellation_check=cancellation_check,
+            )
+        except BaseException as exc:
+            _record_screening_stage("llm_ranking", llm_started_at, success=False, error=exc)
+            raise
+        _record_screening_stage(
+            "llm_ranking",
+            llm_started_at,
+            success=bool(llm_result.ranked),
+            record_count=len(llm_result.picks),
         )
         _check_cancelled(cancellation_check)
         degradation.extend(llm_prompt_degradation)
@@ -565,14 +616,21 @@ def screen(
                 f"Remote post-analysis cap {post_max_picks} < requested output {output_count}; "
                 "rotation eligibility constrained to remotely analyzed picks"
             )
-        picks, post_degradation = run_post_analyzers(
-            picks,
-            analyzer_names=analyzer_names,
-            run_id=run_id,
-            config=config,
-            max_picks=post_max_picks,
-            scorecard_profile=screening.scorecard_profile,
-        )
+        post_started_at = time.monotonic()
+        try:
+            picks, post_degradation = run_post_analyzers(
+                picks,
+                analyzer_names=analyzer_names,
+                run_id=run_id,
+                config=config,
+                max_picks=post_max_picks,
+                scorecard_profile=screening.scorecard_profile,
+                cancellation_check=cancellation_check,
+            )
+        except BaseException as exc:
+            _record_screening_stage("post_analysis", post_started_at, success=False, error=exc)
+            raise
+        _record_screening_stage("post_analysis", post_started_at, record_count=len(picks))
         _check_cancelled(cancellation_check)
         degradation.extend(post_degradation)
 
@@ -659,6 +717,28 @@ def _emit_progress(
 def _check_cancelled(callback: Callable[[], None] | None) -> None:
     if callback is not None:
         callback()
+
+
+def _record_screening_stage(
+    operation: str,
+    started_at: float,
+    *,
+    success: bool = True,
+    cache_hit: bool | None = None,
+    record_count: int | None = None,
+    error: BaseException | None = None,
+) -> None:
+    record_provider_run(
+        data_type="screening_stage",
+        provider="pipeline",
+        operation=operation,
+        success=success,
+        latency_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+        cache_hit=cache_hit,
+        record_count=record_count,
+        error_type=type(error).__name__ if error is not None else None,
+        error_message=error,
+    )
 
 
 def _df_to_picks(df: pd.DataFrame) -> list[Pick]:

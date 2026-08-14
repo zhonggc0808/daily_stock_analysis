@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from typing import Callable
 
 from src.config import apply_litellm_api_surface
 from src.llm.errors import call_litellm_with_param_recovery
@@ -82,6 +83,7 @@ def rank_candidates(
     timeout_sec: float = 60.0,
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
     max_tokens: int | None = 2048,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> list[Pick]:
     """Use LLM to re-rank candidates and add ranking_reason / risk_summary.
 
@@ -106,6 +108,7 @@ def rank_candidates(
         timeout_sec=timeout_sec,
         max_prompt_chars=max_prompt_chars,
         max_tokens=max_tokens,
+        cancellation_check=cancellation_check,
     ).picks
 
 
@@ -130,8 +133,10 @@ def rank_candidates_with_metadata(
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
     degradation: list[str] | None = None,
     max_tokens: int | None = 2048,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> LLMRankingResult:
     """Use LLM to re-rank candidates and return global research metadata."""
+    _check_cancelled(cancellation_check)
     if not candidates:
         return LLMRankingResult(picks=candidates)
 
@@ -150,9 +155,11 @@ def rank_candidates_with_metadata(
     failure_reason = "no_model_configured"
 
     for candidate_model in model_chain:
+        _check_cancelled(cancellation_check)
         attempted_models.append(candidate_model)
         model_errors: list[str] = []
         for attempt in range(max_retries + 1):
+            _check_cancelled(cancellation_check)
             attempt_prompt = prompt
             if attempt:
                 attempt_prompt += (
@@ -178,10 +185,12 @@ def rank_candidates_with_metadata(
                     max_tokens=max_tokens,
                 )
             except Exception as exc:
+                _check_cancelled(cancellation_check)
                 failure_reason = "timeout" if _is_timeout_error(exc) else "call_failed"
                 model_errors.append(f"{failure_reason}:{exc.__class__.__name__}")
                 break
 
+            _check_cancelled(cancellation_check)
             parsed = _parse_ranking_response_detail(response, candidates)
             last_coverage = parsed.coverage
             model_errors.extend(parsed.errors)
@@ -212,6 +221,7 @@ def rank_candidates_with_metadata(
             )
 
         all_errors.extend(f"{candidate_model}:{error}" for error in _dedupe(model_errors))
+        _check_cancelled(cancellation_check)
         logger.warning(
             "LLM ranking model=%s returned no usable ranking; trying next fallback; errors=%s",
             candidate_model,
@@ -232,6 +242,11 @@ def rank_candidates_with_metadata(
         attempted_models=attempted_models,
         failure_reason=failure_reason,
     )
+
+
+def _check_cancelled(cancellation_check: Callable[[], None] | None) -> None:
+    if cancellation_check is not None:
+        cancellation_check()
 
 
 def _build_ranking_prompt(

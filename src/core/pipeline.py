@@ -82,6 +82,7 @@ from src.services.run_diagnostics import (
     record_llm_run,
     record_llm_run_started,
     record_notification_run,
+    record_provider_run,
     reset_run_diagnostic_context,
     sanitize_diagnostic_text,
 )
@@ -105,6 +106,26 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
+
+
+def _record_analysis_stage(
+    operation: str,
+    started_at: float,
+    *,
+    success: bool = True,
+    record_count: Optional[int] = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    record_provider_run(
+        data_type="analysis_stage",
+        provider="pipeline",
+        operation=operation,
+        success=success,
+        latency_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+        record_count=record_count,
+        error_type=type(error).__name__ if error is not None else None,
+        error_message=error,
+    )
 
 def _share_image_payload(result: Any) -> Optional[Dict[str, Any]]:
     """Return structured poster data when the result exposes the real contract."""
@@ -538,6 +559,8 @@ class StockAnalysisPipeline:
                 "news": fetch_news,
             }
             branch_results: Dict[str, Any] = {"quote": None, "chip": None, "news": {}}
+            branch_errors: Dict[str, Exception] = {}
+            primary_io_started_at = time.monotonic()
             parallel_io = bool(getattr(self.config, "analysis_parallel_io_enabled", True))
             if parallel_io:
                 worker_count = min(
@@ -555,6 +578,7 @@ class StockAnalysisPipeline:
                         try:
                             branch_results[branch_name] = future.result()
                         except Exception as exc:
+                            branch_errors[branch_name] = exc
                             logger.warning("%s(%s) %s 分支失败，已独立降级: %s", stock_name, code, branch_name, exc)
             else:
                 logger.info("%s(%s) 外部数据并发已关闭，使用串行兼容路径", stock_name, code)
@@ -562,7 +586,16 @@ class StockAnalysisPipeline:
                     try:
                         branch_results[branch_name] = branch_call()
                     except Exception as exc:
+                        branch_errors[branch_name] = exc
                         logger.warning("%s(%s) %s 分支失败，已独立降级: %s", stock_name, code, branch_name, exc)
+
+            _record_analysis_stage(
+                "primary_io",
+                primary_io_started_at,
+                success=not branch_errors,
+                record_count=len(branch_calls) - len(branch_errors),
+                error=next(iter(branch_errors.values()), None),
+            )
 
             realtime_quote = branch_results["quote"]
             chip_data = branch_results["chip"]
@@ -592,8 +625,7 @@ class StockAnalysisPipeline:
             # Step 2.5: 基本面能力聚合（统一入口，异常降级）
             # - 失败时返回 partial/failed，不影响既有技术面/新闻链路
             # - 关闭开关时仍返回 not_supported 结构
-            fundamental_context = None
-            try:
+            def fetch_fundamental_context() -> Dict[str, Any]:
                 fundamental_kwargs = {
                     "budget_seconds": getattr(
                         self.config,
@@ -604,28 +636,122 @@ class StockAnalysisPipeline:
                 }
                 if force_refresh:
                     fundamental_kwargs["force_refresh"] = True
-                fundamental_context = self.fetcher_manager.get_fundamental_context(
-                    code,
-                    **fundamental_kwargs,
-                )
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
-                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
+                try:
+                    return self.fetcher_manager.get_fundamental_context(
+                        code,
+                        **fundamental_kwargs,
+                    )
+                except Exception as exc:
+                    logger.warning(f"{stock_name}({code}) 基本面聚合失败: {exc}")
+                    return self.fetcher_manager.build_failed_fundamental_context(code, str(exc))
 
-            fundamental_context = self._attach_belong_boards_to_fundamental_context(
-                code,
-                fundamental_context,
-                force_refresh=force_refresh,
+            def fetch_persisted_intelligence() -> Optional[str]:
+                return self._load_persisted_intelligence_context(
+                    code=code,
+                    stock_name=stock_name,
+                    market=market or "cn",
+                )
+
+            secondary_calls = {
+                "fundamental": fetch_fundamental_context,
+                "local_intelligence": fetch_persisted_intelligence,
+            }
+            secondary_results: Dict[str, Any] = {
+                "fundamental": None,
+                "local_intelligence": None,
+            }
+            secondary_errors: Dict[str, Exception] = {}
+            secondary_started_at = time.monotonic()
+            if parallel_io:
+                worker_count = min(
+                    max(1, int(getattr(self.config, "analysis_io_max_concurrency", 3))),
+                    len(secondary_calls),
+                )
+                with ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix="analysis-context",
+                ) as executor:
+                    futures = {}
+                    for branch_name, branch_call in secondary_calls.items():
+                        thread_context = contextvars.copy_context()
+                        futures[executor.submit(thread_context.run, branch_call)] = branch_name
+                    for future in as_completed(futures):
+                        branch_name = futures[future]
+                        try:
+                            secondary_results[branch_name] = future.result()
+                        except Exception as exc:
+                            secondary_errors[branch_name] = exc
+                            logger.warning(
+                                "%s(%s) %s 分支失败，已独立降级: %s",
+                                stock_name,
+                                code,
+                                branch_name,
+                                exc,
+                            )
+            else:
+                for branch_name, branch_call in secondary_calls.items():
+                    try:
+                        secondary_results[branch_name] = branch_call()
+                    except Exception as exc:
+                        secondary_errors[branch_name] = exc
+                        logger.warning(
+                            "%s(%s) %s 分支失败，已独立降级: %s",
+                            stock_name,
+                            code,
+                            branch_name,
+                            exc,
+                        )
+            _record_analysis_stage(
+                "fundamental_and_local_intel",
+                secondary_started_at,
+                success=not secondary_errors,
+                record_count=len(secondary_calls) - len(secondary_errors),
+                error=next(iter(secondary_errors.values()), None),
             )
-            market_structure_context = self._build_market_structure_context(
-                code=code,
-                stock_name=stock_name,
-                market=market,
-                fundamental_context=fundamental_context,
-                trade_date=daily_market_target_date,
-                market_phase_summary=market_phase_summary,
-                force_refresh=force_refresh,
-            )
+            fundamental_context = secondary_results["fundamental"]
+            persisted_intelligence_context = secondary_results["local_intelligence"]
+            if not isinstance(fundamental_context, dict):
+                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(
+                    code,
+                    "fundamental context unavailable",
+                )
+
+            board_started_at = time.monotonic()
+            try:
+                fundamental_context = self._attach_belong_boards_to_fundamental_context(
+                    code,
+                    fundamental_context,
+                    force_refresh=force_refresh,
+                )
+            except BaseException as exc:
+                _record_analysis_stage(
+                    "board_enrichment",
+                    board_started_at,
+                    success=False,
+                    error=exc,
+                )
+                raise
+            _record_analysis_stage("board_enrichment", board_started_at)
+            market_structure_started_at = time.monotonic()
+            try:
+                market_structure_context = self._build_market_structure_context(
+                    code=code,
+                    stock_name=stock_name,
+                    market=market,
+                    fundamental_context=fundamental_context,
+                    trade_date=daily_market_target_date,
+                    market_phase_summary=market_phase_summary,
+                    force_refresh=force_refresh,
+                )
+            except BaseException as exc:
+                _record_analysis_stage(
+                    "market_structure",
+                    market_structure_started_at,
+                    success=False,
+                    error=exc,
+                )
+                raise
+            _record_analysis_stage("market_structure", market_structure_started_at)
 
             # P0: write-only snapshot, fail-open, no read dependency on this table.
             try:
@@ -676,15 +802,11 @@ class StockAnalysisPipeline:
                     daily_market_context=daily_market_context,
                     portfolio_context=portfolio_context,
                     market_structure_context=market_structure_context,
+                    persisted_intelligence_context=persisted_intelligence_context,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
-            persisted_intelligence_context = self._load_persisted_intelligence_context(
-                code=code,
-                stock_name=stock_name,
-                market=market or "cn",
-            )
             news_result_count: Optional[int] = None
             self._emit_progress(46, f"{stock_name}：正在检索新闻与舆情")
             if self.search_service is not None and self.search_service.is_available:
@@ -717,9 +839,10 @@ class StockAnalysisPipeline:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
 
             # Step 4.5: Social sentiment intelligence (US stocks only)
-            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+            social_sentiment_service = getattr(self, "social_sentiment_service", None)
+            if social_sentiment_service is not None and social_sentiment_service.is_available and is_us_stock_code(code):
                 try:
-                    social_context = self.social_sentiment_service.get_social_context(code)
+                    social_context = social_sentiment_service.get_social_context(code)
                     if social_context:
                         logger.info(f"{stock_name}({code}) Social sentiment data retrieved")
                         if news_context:
@@ -845,6 +968,12 @@ class StockAnalysisPipeline:
                     ),
                 )
             except Exception as exc:
+                _record_analysis_stage(
+                    "llm",
+                    llm_started_at,
+                    success=False,
+                    error=exc,
+                )
                 record_llm_run(
                     success=False,
                     model=getattr(self.config, "litellm_model", None),
@@ -854,6 +983,11 @@ class StockAnalysisPipeline:
                     error_message=exc,
                 )
                 raise
+            _record_analysis_stage(
+                "llm",
+                llm_started_at,
+                success=bool(result and getattr(result, "success", True)),
+            )
 
             # Step 7.5: 填充分析时的价格信息到 result
             if result:
@@ -1456,6 +1590,7 @@ class StockAnalysisPipeline:
         daily_market_context: Optional[DailyMarketContext] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
         market_structure_context: Optional[Dict[str, Any]] = None,
+        persisted_intelligence_context: Optional[str] = None,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -1504,9 +1639,10 @@ class StockAnalysisPipeline:
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
             # can consume it through the existing news_context channel
-            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+            social_sentiment_service = getattr(self, "social_sentiment_service", None)
+            if social_sentiment_service is not None and social_sentiment_service.is_available and is_us_stock_code(code):
                 try:
-                    social_context = self.social_sentiment_service.get_social_context(code)
+                    social_context = social_sentiment_service.get_social_context(code)
                     if social_context:
                         existing = initial_context.get("news_context")
                         if existing:
@@ -1517,11 +1653,6 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"[{code}] Agent mode: social sentiment fetch failed: {e}")
 
-            persisted_intelligence_context = self._load_persisted_intelligence_context(
-                code=code,
-                stock_name=stock_name,
-                market=get_market_for_stock(normalize_stock_code(code)) or "cn",
-            )
             if persisted_intelligence_context:
                 existing = initial_context.get("news_context")
                 initial_context["news_context"] = (
@@ -1571,6 +1702,12 @@ class StockAnalysisPipeline:
                 )
                 agent_result = executor.run(message, context=initial_context)
             except Exception as exc:
+                _record_analysis_stage(
+                    "llm",
+                    llm_started_at,
+                    success=False,
+                    error=exc,
+                )
                 record_llm_run(
                     success=False,
                     model=getattr(self.config, "agent_litellm_model", None),
@@ -1605,6 +1742,11 @@ class StockAnalysisPipeline:
                     if result and not getattr(result, "success", True)
                     else ("Agent returned empty result" if result is None else None)
                 ),
+            )
+            _record_analysis_stage(
+                "llm",
+                llm_started_at,
+                success=bool(result and getattr(result, "success", True)),
             )
             if result:
                 result.query_id = query_id

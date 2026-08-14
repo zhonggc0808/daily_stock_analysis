@@ -2,6 +2,7 @@
 """Regression contracts for the DSA-owned screening implementation."""
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import threading
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import pandas as pd
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient as FastAPITestClient
 
@@ -20,6 +22,7 @@ from src.services.screening.dsa_provider import apply_dsa_provider_context
 from src.services.screening import pipeline as screening_pipeline
 from src.services.screening import daily as screening_daily
 from src.services.screening import post_analysis as screening_post_analysis
+from src.services.screening import ranker as screening_ranker
 from src.services.screening.filter import apply_hard_filters
 from src.services.screening.config import Config as ScreeningRuntimeConfig
 from src.services.screening.models import HardFilterConfig, Pick, ScreeningConfig, Strategy
@@ -192,7 +195,11 @@ def test_pipeline_passes_daily_history_cache_settings_to_enrichment(monkeypatch)
         lambda df, _screening: df.assign(screen_score=88.0),
     )
     monkeypatch.setattr(screening_pipeline, "enrich_daily_features", fake_enrich_daily_features)
-    monkeypatch.setattr(screening_pipeline, "apply_dsa_provider_context", lambda picks, _context: [])
+    monkeypatch.setattr(
+        screening_pipeline,
+        "apply_dsa_provider_context",
+        lambda picks, _context, **_kwargs: [],
+    )
     monkeypatch.setattr(screening_pipeline, "apply_risk_overlay", lambda picks, **kwargs: (picks, []))
     monkeypatch.setattr(screening_pipeline, "apply_portfolio_overlay", lambda picks, **kwargs: (picks, []))
     monkeypatch.setattr(screening_pipeline, "run_post_analyzers", lambda picks, **kwargs: (picks, []))
@@ -473,7 +480,11 @@ def test_pipeline_uses_ranker_success_flag_instead_of_partial_llm_scores(monkeyp
         "compute_screen_scores",
         lambda df, _screening: df.assign(screen_score=88.0),
     )
-    monkeypatch.setattr(screening_pipeline, "apply_dsa_provider_context", lambda picks, _context: [])
+    monkeypatch.setattr(
+        screening_pipeline,
+        "apply_dsa_provider_context",
+        lambda picks, _context, **_kwargs: [],
+    )
     monkeypatch.setattr(screening_pipeline, "rank_candidates_with_metadata", fake_ranker)
     monkeypatch.setattr(screening_pipeline, "apply_risk_overlay", lambda picks, **kwargs: (picks, []))
     monkeypatch.setattr(screening_pipeline, "apply_portfolio_overlay", lambda picks, **kwargs: (picks, []))
@@ -543,7 +554,11 @@ def test_default_scorecard_scores_full_pool_before_seeded_rotation(monkeypatch) 
         "compute_screen_scores",
         lambda df, _screening: df.assign(screen_score=df["raw_score"]),
     )
-    monkeypatch.setattr(screening_pipeline, "apply_dsa_provider_context", lambda picks, _context: [])
+    monkeypatch.setattr(
+        screening_pipeline,
+        "apply_dsa_provider_context",
+        lambda picks, _context, **_kwargs: [],
+    )
     monkeypatch.setattr(screening_pipeline, "apply_seeded_selection_variant", capture_variant)
     monkeypatch.setattr(screening_pipeline.uuid, "uuid4", lambda: SimpleNamespace(hex=next(run_ids)))
 
@@ -623,6 +638,173 @@ def test_dsa_provider_context_fetches_candidates_with_bounded_concurrency() -> N
     assert set(requested_codes) == {"000001", "000002", "000003"}
     assert peak_active == 3
     assert notes == ["DSA provider context applied 3 of 3 candidates"]
+
+
+def test_dsa_provider_context_propagates_cancellation_after_external_call() -> None:
+    picks = [
+        Pick(rank=index + 1, code=f"00000{index + 1}", name="Stock", final_score=0.0, screen_score=0.0)
+        for index in range(3)
+    ]
+    cancelled = threading.Event()
+
+    def get_candidate_context(_code: str, _name: str) -> dict[str, object]:
+        cancelled.set()
+        return {"enriched": True}
+
+    def check_cancelled() -> None:
+        if cancelled.is_set():
+            raise RuntimeError("screening cancelled")
+
+    with pytest.raises(RuntimeError, match="screening cancelled"):
+        apply_dsa_provider_context(
+            picks,
+            {"dsa": {"get_candidate_context": get_candidate_context}},
+            cancellation_check=check_cancelled,
+        )
+
+
+def test_dsa_provider_context_cancels_while_external_calls_are_blocked() -> None:
+    picks = [
+        Pick(rank=index + 1, code=f"00000{index + 1}", name="Stock", final_score=0.0, screen_score=0.0)
+        for index in range(3)
+    ]
+    all_started = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    lock = threading.Lock()
+    started_count = 0
+
+    def get_candidate_context(_code: str, _name: str) -> dict[str, object]:
+        nonlocal started_count
+        with lock:
+            started_count += 1
+            if started_count == len(picks):
+                all_started.set()
+        assert release.wait(timeout=2)
+        return {"enriched": True}
+
+    def check_cancelled() -> None:
+        if cancelled.is_set():
+            raise RuntimeError("screening cancelled")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        call = executor.submit(
+            apply_dsa_provider_context,
+            picks,
+            {"dsa": {"get_candidate_context": get_candidate_context}},
+            cancellation_check=check_cancelled,
+        )
+        assert all_started.wait(timeout=1)
+        cancelled.set()
+        try:
+            with pytest.raises(RuntimeError, match="screening cancelled"):
+                call.result(timeout=1)
+        finally:
+            release.set()
+
+
+def test_dsa_deep_analysis_cancels_while_external_calls_are_blocked(monkeypatch) -> None:
+    picks = [
+        Pick(rank=index + 1, code=f"00000{index + 1}", name="Stock", final_score=0.0, screen_score=0.0)
+        for index in range(3)
+    ]
+    all_started = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    lock = threading.Lock()
+    started_count = 0
+
+    def call_dsa(*_args, **_kwargs) -> dict[str, object]:
+        nonlocal started_count
+        with lock:
+            started_count += 1
+            if started_count == len(picks):
+                all_started.set()
+        assert release.wait(timeout=2)
+        return {"query_id": "completed"}
+
+    def check_cancelled() -> None:
+        if cancelled.is_set():
+            raise RuntimeError("screening cancelled")
+
+    monkeypatch.setattr(screening_dsa, "call_dsa_analysis", call_dsa)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        call = executor.submit(
+            screening_dsa.analyze_picks_with_dsa,
+            picks,
+            run_id="run-cancel",
+            api_url="http://dsa.example",
+            cancellation_check=check_cancelled,
+        )
+        assert all_started.wait(timeout=1)
+        cancelled.set()
+        try:
+            with pytest.raises(RuntimeError, match="screening cancelled"):
+                call.result(timeout=1)
+        finally:
+            release.set()
+
+
+def test_llm_ranking_cancellation_stops_fallback_models(monkeypatch) -> None:
+    pick = Pick(rank=1, code="000001", name="Stock", final_score=80.0, screen_score=80.0)
+    cancelled = False
+    calls: list[str] = []
+
+    def fake_call(*_args, **kwargs):
+        nonlocal cancelled
+        calls.append(str(_args[2]))
+        cancelled = True
+        raise RuntimeError("transport failed")
+
+    def check_cancelled() -> None:
+        if cancelled:
+            raise RuntimeError("screening cancelled")
+
+    monkeypatch.setattr(screening_ranker, "_call_llm", fake_call)
+
+    with pytest.raises(RuntimeError, match="screening cancelled"):
+        screening_ranker.rank_candidates_with_metadata(
+            [pick],
+            "hints",
+            "key",
+            "primary",
+            fallback_models=["fallback"],
+            cancellation_check=check_cancelled,
+        )
+
+    assert calls == ["primary"]
+
+
+def test_post_analysis_cancellation_prevents_later_analyzers(monkeypatch) -> None:
+    pick = Pick(rank=1, code="000001", name="Stock", final_score=80.0, screen_score=80.0)
+    cancelled = False
+
+    def fake_scorecard(picks, **_kwargs):
+        nonlocal cancelled
+        cancelled = True
+        return picks, []
+
+    external = patch.object(
+        screening_post_analysis,
+        "_run_external_http_analyzer",
+        side_effect=AssertionError("later analyzer must not run"),
+    )
+    monkeypatch.setattr(screening_post_analysis, "_run_scorecard_analyzer", fake_scorecard)
+
+    def check_cancelled() -> None:
+        if cancelled:
+            raise RuntimeError("screening cancelled")
+
+    with external as external_mock, pytest.raises(RuntimeError, match="screening cancelled"):
+        screening_post_analysis.run_post_analyzers(
+            [pick],
+            analyzer_names=["scorecard", "external_http"],
+            run_id="run-cancel",
+            config=SimpleNamespace(post_analysis_max_picks=1),
+            cancellation_check=check_cancelled,
+        )
+
+    external_mock.assert_not_called()
 
 
 def test_dsa_empty_dict_response_is_completed(monkeypatch) -> None:
@@ -913,6 +1095,161 @@ def test_fresh_snapshot_cache_skips_live_sources(tmp_path, monkeypatch) -> None:
     assert result.attrs["fallback_used"] is False
     assert result.attrs["stale"] is False
     assert result.attrs["last_good_snapshot_source"] == "sina"
+
+
+def test_snapshot_singleflight_coalesces_identical_requests_and_isolates_results(
+    monkeypatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    waiter_joined = threading.Event()
+    calls = 0
+    snapshot = pd.DataFrame([{"code": "000001", "price": 10.0}])
+
+    def fake_fetch(*_args, **_kwargs) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=2)
+        return snapshot
+
+    monkeypatch.setattr(screening_snapshot, "_SNAPSHOT_INFLIGHT", {})
+    monkeypatch.setattr(screening_snapshot, "_fetch_snapshot_with_fallback_uncached", fake_fetch)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(
+            screening_snapshot.fetch_snapshot_with_fallback,
+            ["sina"],
+            required_columns=["price"],
+        )
+        assert started.wait(timeout=1)
+        waiter = executor.submit(
+            screening_snapshot.fetch_snapshot_with_fallback,
+            ["sina"],
+            required_columns=["price"],
+            cancellation_check=waiter_joined.set,
+        )
+        assert waiter_joined.wait(timeout=1)
+        release.set()
+        owner_result = owner.result(timeout=2)
+        waiter_result = waiter.result(timeout=2)
+
+    assert calls == 1
+    assert owner_result.attrs["snapshot_singleflight_shared"] is False
+    assert waiter_result.attrs["snapshot_singleflight_shared"] is True
+    waiter_result.loc[0, "price"] = 99.0
+    assert owner_result.loc[0, "price"] == 10.0
+
+
+def test_snapshot_singleflight_failure_wakes_waiters_and_allows_retry(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    waiter_joined = threading.Event()
+    attempts = 0
+
+    def fake_fetch(*_args, **_kwargs) -> pd.DataFrame:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            started.set()
+            assert release.wait(timeout=2)
+            raise RuntimeError("snapshot failed")
+        return pd.DataFrame([{"code": "000001", "price": 10.0}])
+
+    monkeypatch.setattr(screening_snapshot, "_SNAPSHOT_INFLIGHT", {})
+    monkeypatch.setattr(screening_snapshot, "_fetch_snapshot_with_fallback_uncached", fake_fetch)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(screening_snapshot.fetch_snapshot_with_fallback, ["sina"])
+        assert started.wait(timeout=1)
+        second = executor.submit(
+            screening_snapshot.fetch_snapshot_with_fallback,
+            ["sina"],
+            cancellation_check=waiter_joined.set,
+        )
+        assert waiter_joined.wait(timeout=1)
+        release.set()
+        for future in (first, second):
+            with pytest.raises(RuntimeError, match="snapshot failed"):
+                future.result(timeout=2)
+
+    retried = screening_snapshot.fetch_snapshot_with_fallback(["sina"])
+    assert attempts == 2
+    assert retried.loc[0, "price"] == 10.0
+
+
+def test_snapshot_singleflight_waiter_can_cancel_without_failing_owner(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    waiter_cancelled = threading.Event()
+    waiter_polling = threading.Event()
+
+    def fake_fetch(*_args, **_kwargs) -> pd.DataFrame:
+        started.set()
+        assert release.wait(timeout=2)
+        return pd.DataFrame([{"code": "000001", "price": 10.0}])
+
+    def check_waiter_cancelled() -> None:
+        waiter_polling.set()
+        if waiter_cancelled.is_set():
+            raise RuntimeError("screening cancelled")
+
+    monkeypatch.setattr(screening_snapshot, "_SNAPSHOT_INFLIGHT", {})
+    monkeypatch.setattr(screening_snapshot, "_fetch_snapshot_with_fallback_uncached", fake_fetch)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(screening_snapshot.fetch_snapshot_with_fallback, ["sina"])
+        assert started.wait(timeout=1)
+        waiter = executor.submit(
+            screening_snapshot.fetch_snapshot_with_fallback,
+            ["sina"],
+            cancellation_check=check_waiter_cancelled,
+        )
+        assert waiter_polling.wait(timeout=1)
+        waiter_cancelled.set()
+        with pytest.raises(RuntimeError, match="screening cancelled"):
+            waiter.result(timeout=1)
+        release.set()
+        owner_result = owner.result(timeout=2)
+
+    assert owner_result.loc[0, "price"] == 10.0
+
+
+def test_snapshot_singleflight_owner_can_cancel_without_failing_waiter(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    owner_cancelled = threading.Event()
+
+    def fake_fetch(*_args, **_kwargs) -> pd.DataFrame:
+        started.set()
+        assert release.wait(timeout=2)
+        return pd.DataFrame([{"code": "000001", "price": 10.0}])
+
+    def check_owner_cancelled() -> None:
+        if owner_cancelled.is_set():
+            raise RuntimeError("screening cancelled")
+
+    monkeypatch.setattr(screening_snapshot, "_SNAPSHOT_INFLIGHT", {})
+    monkeypatch.setattr(screening_snapshot, "_fetch_snapshot_with_fallback_uncached", fake_fetch)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(
+            screening_snapshot.fetch_snapshot_with_fallback,
+            ["sina"],
+            cancellation_check=check_owner_cancelled,
+        )
+        assert started.wait(timeout=1)
+        waiter = executor.submit(screening_snapshot.fetch_snapshot_with_fallback, ["sina"])
+        owner_cancelled.set()
+        try:
+            with pytest.raises(RuntimeError, match="screening cancelled"):
+                owner.result(timeout=1)
+        finally:
+            release.set()
+        waiter_result = waiter.result(timeout=2)
+
+    assert waiter_result.loc[0, "price"] == 10.0
+    assert waiter_result.attrs["snapshot_singleflight_shared"] is True
 
 
 def test_fresh_snapshot_cache_ignores_mismatched_source(tmp_path, monkeypatch) -> None:
