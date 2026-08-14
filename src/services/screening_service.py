@@ -8,6 +8,8 @@ see ``THIRD_PARTY_NOTICES.md`` and per-file headers for attribution.
 from __future__ import annotations
 
 import importlib
+import contextvars
+import copy
 import hashlib
 import json
 import logging
@@ -17,7 +19,7 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
@@ -2987,6 +2989,51 @@ def _build_screening_context(config: Config, *, max_results: Optional[int] = Non
     # 参见 https://docs.litellm.ai/docs/proxy/configs#the-model_list-key
     channels = _normalize_dsa_llm_channels(config)
     litellm_model, fallback_models = _resolve_screening_llm_models(config)
+    candidate_context_cache: Dict[
+        Tuple[str, bool, bool, str], Future[Dict[str, Any]]
+    ] = {}
+    candidate_context_cache_lock = threading.Lock()
+
+    def get_cached_candidate_context(
+        stock_code: str,
+        stock_name: str = "",
+        *,
+        include_news: bool = False,
+        include_fundamentals: bool = True,
+        mode: str = "pre_rank_light",
+    ) -> Dict[str, Any]:
+        cache_key = (
+            _env_text(stock_code),
+            bool(include_news),
+            bool(include_fundamentals),
+            mode or "pre_rank_light",
+        )
+        with candidate_context_cache_lock:
+            pending = candidate_context_cache.get(cache_key)
+            should_fetch = pending is None
+            if pending is None:
+                pending = Future()
+                candidate_context_cache[cache_key] = pending
+
+        if should_fetch:
+            try:
+                resolved = get_dsa_candidate_context(
+                    stock_code,
+                    stock_name,
+                    include_news=include_news,
+                    include_fundamentals=include_fundamentals,
+                    mode=mode,
+                )
+                pending.set_result(copy.deepcopy(resolved))
+            except BaseException as exc:
+                pending.set_exception(exc)
+                with candidate_context_cache_lock:
+                    if candidate_context_cache.get(cache_key) is pending:
+                        candidate_context_cache.pop(cache_key, None)
+                raise
+
+        return copy.deepcopy(pending.result())
+
     return {
         "llm": {
             "model": litellm_model,
@@ -3012,7 +3059,7 @@ def _build_screening_context(config: Config, *, max_results: Optional[int] = Non
                 "fundamental_context",
                 "stock_events",
             ],
-            "get_candidate_context": get_dsa_candidate_context,
+            "get_candidate_context": get_cached_candidate_context,
             "get_daily_history": get_dsa_daily_history,
             "get_realtime_quote": get_dsa_realtime_quote,
             "get_fundamental_context": get_dsa_fundamental_context,
@@ -3335,11 +3382,15 @@ def _get_dsa_search_service() -> Any:
 
 
 def get_dsa_daily_history(stock_code: str, *, lookback_days: int = 120) -> Tuple[Any, str]:
+    from data_provider.base import normalize_stock_code
+    from src.core.trading_calendar import get_effective_trading_date, get_market_for_stock
     from src.services.history_loader import load_history_df
 
-    normalized_code = _env_text(stock_code).zfill(6)
+    normalized_code = normalize_stock_code(_env_text(stock_code))
+    market = get_market_for_stock(normalized_code)
+    target_date = get_effective_trading_date(market)
     days = max(int(lookback_days or 0), 30)
-    return load_history_df(normalized_code, days=days)
+    return load_history_df(normalized_code, days=days, target_date=target_date)
 
 
 def _normalize_dsa_daily_history(raw_df: Any) -> Any:
@@ -3483,35 +3534,76 @@ def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[
     warnings: List[str] = []
     limit = min(len(candidates), DSA_ENRICHMENT_MAX_CANDIDATES)
 
-    for index, candidate in enumerate(candidates):
-        if index >= limit:
-            continue
+    enrich_results: List[Tuple[Dict[str, Any] | None, Exception | None]] = [
+        (None, None) for _ in range(limit)
+    ]
+    reused_indices: set[int] = set()
+
+    def enrich_one(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        working_candidate = dict(candidate)
+        enriched = _build_dsa_candidate_context(
+            working_candidate,
+            include_news=True,
+            include_fundamentals=True,
+            profile="post_rank_full",
+        )
+        for field in ("name", "price", "change_pct", "amount"):
+            if working_candidate.get(field) not in (None, ""):
+                enriched[field] = working_candidate[field]
+        return enriched
+
+    pending_indices = []
+    for index, candidate in enumerate(candidates[:limit]):
         existing_context = candidate.get("dsa_context")
         if (
             isinstance(existing_context, dict)
             and existing_context.get("enriched")
             and _candidate_has_dsa_news(candidate)
         ):
+            reused_indices.add(index)
+        else:
+            pending_indices.append(index)
+
+    if len(pending_indices) == 1:
+        index = pending_indices[0]
+        try:
+            enrich_results[index] = (enrich_one(candidates[index]), None)
+        except Exception as exc:  # noqa: BLE001
+            enrich_results[index] = (None, exc)
+    elif pending_indices:
+        worker_count = min(3, len(pending_indices))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="screening-dsa") as executor:
+            futures = {}
+            for index in pending_indices:
+                thread_context = contextvars.copy_context()
+                futures[
+                    executor.submit(thread_context.run, enrich_one, candidates[index])
+                ] = index
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    enrich_results[index] = (future.result(), None)
+                except Exception as exc:  # noqa: BLE001
+                    enrich_results[index] = (None, exc)
+
+    for index, candidate in enumerate(candidates[:limit]):
+        enriched, error = enrich_results[index]
+        existing_context = candidate.get("dsa_context")
+        if index in reused_indices:
             enriched_count += 1
-            existing_warnings = existing_context.get("warnings") or []
+            existing_warnings = (
+                existing_context.get("warnings") or []
+                if isinstance(existing_context, dict)
+                else []
+            )
             if isinstance(existing_warnings, list):
                 warnings.extend(str(item) for item in existing_warnings if item)
             elif existing_warnings:
                 warnings.append(str(existing_warnings))
             continue
-        try:
-            enriched = _build_dsa_candidate_context(
-                candidate,
-                include_news=True,
-                include_fundamentals=True,
-                profile="post_rank_full",
-            )
-            candidate.update(enriched)
-            if enriched.get("dsa_context", {}).get("enriched"):
-                enriched_count += 1
-            warnings.extend(enriched.get("dsa_context", {}).get("warnings") or [])
-        except Exception as exc:  # noqa: BLE001 - DSA enrichment must not block screening.
+        if error is not None:
             code = candidate.get("code") or f"rank-{candidate.get('rank', index + 1)}"
+            exc = error
             message = f"{code}: {exc}"
             warnings.append(message)
             logger.warning("DSA enrichment failed for Screening candidate %s: %s", code, exc)
@@ -3519,6 +3611,12 @@ def _enrich_candidates_with_dsa(candidates: List[Dict[str, Any]]) -> Tuple[List[
                 "enriched": False,
                 "warnings": [message],
             }
+            continue
+        if enriched is not None:
+            candidate.update(enriched)
+            if enriched.get("dsa_context", {}).get("enriched"):
+                enriched_count += 1
+            warnings.extend(enriched.get("dsa_context", {}).get("warnings") or [])
 
     return candidates, {
         "enabled": True,
@@ -3546,6 +3644,37 @@ def _news_has_results(news: Any) -> bool:
     if isinstance(news, list):
         return any(isinstance(item, dict) for item in news)
     return False
+
+
+def _run_dsa_context_fetches(
+    calls: Dict[str, Callable[[], Any]],
+) -> Dict[str, Tuple[Any, Exception | None]]:
+    """Run independent candidate capability calls with a small fixed fan-out."""
+    if not calls:
+        return {}
+    if len(calls) == 1:
+        name, call = next(iter(calls.items()))
+        try:
+            return {name: (call(), None)}
+        except Exception as exc:  # noqa: BLE001
+            return {name: (None, exc)}
+
+    results: Dict[str, Tuple[Any, Exception | None]] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(2, len(calls)),
+        thread_name_prefix="screening-dsa-capability",
+    ) as executor:
+        futures = {}
+        for name, call in calls.items():
+            thread_context = contextvars.copy_context()
+            futures[executor.submit(thread_context.run, call)] = name
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = (future.result(), None)
+            except Exception as exc:  # noqa: BLE001
+                results[name] = (None, exc)
+    return results
 
 
 def _build_dsa_candidate_context(
@@ -3596,14 +3725,30 @@ def _build_dsa_candidate_context(
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"stock_name_failed: {exc}")
 
+    primary_calls: Dict[str, Callable[[], Any]] = {}
     if not quote:
-        try:
-            quote = get_dsa_realtime_quote(code)
+        primary_calls["quote"] = lambda: get_dsa_realtime_quote(code)
+    if include_fundamentals and not fundamentals:
+        primary_calls["fundamentals"] = lambda: get_dsa_fundamental_context(code)
+    primary_results = _run_dsa_context_fetches(primary_calls)
+
+    if "quote" in primary_results:
+        quote_result, quote_error = primary_results["quote"]
+        if quote_error is not None:
+            warnings.append(f"realtime_quote_failed: {quote_error}")
+            quote = {}
+        else:
+            quote = quote_result if isinstance(quote_result, dict) else {}
             if not quote:
                 warnings.append("realtime_quote_missing")
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"realtime_quote_failed: {exc}")
-            quote = {}
+
+    if "fundamentals" in primary_results:
+        fundamental_result, fundamental_error = primary_results["fundamentals"]
+        if fundamental_error is not None:
+            warnings.append(f"fundamental_context_failed: {fundamental_error}")
+            fundamentals = {}
+        else:
+            fundamentals = fundamental_result if isinstance(fundamental_result, dict) else {}
 
     if quote:
         candidate["price"] = _first_non_empty(candidate.get("price"), quote.get("price"))
@@ -3612,23 +3757,33 @@ def _build_dsa_candidate_context(
         if not candidate.get("name") and quote.get("name"):
             candidate["name"] = quote.get("name")
 
-    if include_fundamentals and not fundamentals:
-        try:
-            fundamentals = get_dsa_fundamental_context(code)
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"fundamental_context_failed: {exc}")
-            fundamentals = {}
+    resolved_name = _env_text(candidate.get("name")) or name or code
+    secondary_calls: Dict[str, Callable[[], Any]] = {}
+    if include_news and not _news_has_results(news):
+        secondary_calls["news"] = lambda: search_dsa_stock_news(
+            code,
+            resolved_name,
+            max_results=3,
+        )
+    if include_events and not _news_has_results(events):
+        secondary_calls["events"] = lambda: search_dsa_stock_events(
+            code,
+            resolved_name,
+            max_results=3,
+        )
+    secondary_results = _run_dsa_context_fetches(secondary_calls)
 
-    if include_news:
-        if not _news_has_results(news):
-            try:
-                news = search_dsa_stock_news(code, _env_text(candidate.get("name")) or name or code, max_results=3)
-                if not news.get("success"):
-                    warnings.append(news.get("error") or "stock_news_unavailable")
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"stock_news_failed: {exc}")
-                news = {"success": False, "error": str(exc), "results": []}
-    elif not _news_has_results(news):
+    if "news" in secondary_results:
+        news_result, news_error = secondary_results["news"]
+        if news_error is not None:
+            warnings.append(f"stock_news_failed: {news_error}")
+            news = {"success": False, "error": str(news_error), "results": []}
+        else:
+            news = news_result if isinstance(news_result, dict) else {"success": False, "results": []}
+            if not news.get("success"):
+                warnings.append(news.get("error") or "stock_news_unavailable")
+
+    if not include_news and not _news_has_results(news):
         news = {
             "success": False,
             "skipped": True,
@@ -3636,20 +3791,17 @@ def _build_dsa_candidate_context(
             "results": [],
         }
 
-    if include_events:
-        if not _news_has_results(events):
-            try:
-                events = search_dsa_stock_events(
-                    code,
-                    _env_text(candidate.get("name")) or name or code,
-                    max_results=3,
-                )
-                if not events.get("success"):
-                    warnings.append(events.get("error") or "stock_events_unavailable")
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"stock_events_failed: {exc}")
-                events = {"success": False, "error": str(exc), "results": []}
-    elif not _news_has_results(events):
+    if "events" in secondary_results:
+        events_result, events_error = secondary_results["events"]
+        if events_error is not None:
+            warnings.append(f"stock_events_failed: {events_error}")
+            events = {"success": False, "error": str(events_error), "results": []}
+        else:
+            events = events_result if isinstance(events_result, dict) else {"success": False, "results": []}
+            if not events.get("success"):
+                warnings.append(events.get("error") or "stock_events_unavailable")
+
+    if not include_events and not _news_has_results(events):
         events = {
             "success": False,
             "skipped": True,

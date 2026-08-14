@@ -11,6 +11,7 @@ Covers:
 """
 import json
 import sys
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -2117,6 +2118,37 @@ class TestAnalyzerGenerateText:
             ("openai/gpt-4o-mini", 0.2),
         ]
 
+    def test_call_litellm_fallback_models_share_one_timeout_budget(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="provider/slow-primary",
+            litellm_fallback_models=["provider/fallback"],
+            llm_model_list=[],
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="fallback ok"))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        observed_timeouts = []
+
+        def fake_dispatch(model, call_kwargs, **_kwargs):
+            observed_timeouts.append((model, call_kwargs["timeout"]))
+            if model == "provider/slow-primary":
+                time.sleep(0.02)
+                raise RuntimeError("primary failed")
+            return response
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", side_effect=fake_dispatch):
+            text, model_used, _usage = analyzer._call_litellm(
+                "prompt",
+                {"max_tokens": 128, "temperature": 0.2, "timeout": 1.0},
+            )
+
+        assert text == "fallback ok"
+        assert model_used == "provider/fallback"
+        assert observed_timeouts[0][1] <= 1.0
+        assert 0 < observed_timeouts[1][1] < observed_timeouts[0][1]
+
     def test_call_litellm_stream_falls_back_to_non_stream_after_partial_and_falls_back_model(self):
         analyzer = self._make_analyzer()
         analyzer._config_override = SimpleNamespace(
@@ -2178,6 +2210,7 @@ class TestAnalyzerGenerateText:
             report_language="zh",
             litellm_model="gemini/gemini-2.0-flash",
             llm_temperature=0.2,
+            analysis_llm_timeout_seconds=5.0,
             report_integrity_enabled=True,
             report_integrity_retry=1,
         )
@@ -2212,7 +2245,7 @@ class TestAnalyzerGenerateText:
                      ("first response", "model-a", {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}),
                      ("second response", "model-a", {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}),
                  ],
-             ), \
+             ) as llm_call, \
              patch.object(analyzer, "_parse_response", side_effect=[first_result, second_result]), \
              patch.object(analyzer, "_build_market_snapshot", return_value={}), \
              patch.object(
@@ -2228,6 +2261,9 @@ class TestAnalyzerGenerateText:
             )
 
         assert result.analysis_summary == "补全后结果"
+        timeout_budgets = [call.args[1]["timeout"] for call in llm_call.call_args_list]
+        assert all(0 < timeout <= 5.0 for timeout in timeout_budgets)
+        assert timeout_budgets[1] <= timeout_budgets[0]
         assert [progress for progress, _ in progress_updates] == [68, 93, 94, 95]
         assert "补全重试" in progress_updates[2][1]
         assert "解析 JSON" in progress_updates[3][1]

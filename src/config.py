@@ -909,6 +909,8 @@ class Config:
 
     # Unified temperature for all LLM calls (LLM_TEMPERATURE); legacy per-provider temps are fallback only
     llm_temperature: float = 0.7
+    # End-to-end budget shared by primary/fallback models and integrity retries.
+    analysis_llm_timeout_seconds: float = 120.0
 
     # Provider prompt-cache controls. These do not control provider implicit cache.
     llm_prompt_cache_telemetry_enabled: bool = True
@@ -2094,6 +2096,13 @@ class Config:
             report_language=cls._parse_report_language(report_language_raw),
             report_summary_only=os.getenv('REPORT_SUMMARY_ONLY', 'false').lower() == 'true',
             report_show_llm_model=report_show_llm_model,
+            analysis_llm_timeout_seconds=parse_env_float(
+                os.getenv('ANALYSIS_LLM_TIMEOUT_SEC'),
+                120.0,
+                field_name='ANALYSIS_LLM_TIMEOUT_SEC',
+                minimum=1.0,
+                maximum=1800.0,
+            ),
             report_templates_dir=os.getenv('REPORT_TEMPLATES_DIR', 'templates'),
             report_renderer_enabled=os.getenv('REPORT_RENDERER_ENABLED', 'false').lower() == 'true',
             report_integrity_enabled=os.getenv('REPORT_INTEGRITY_ENABLED', 'true').lower() == 'true',

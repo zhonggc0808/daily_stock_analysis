@@ -10,7 +10,9 @@ available, but screening should continue when one provider is slow or broken.
 
 from __future__ import annotations
 
+import contextvars
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from src.services.screening.models import Pick
@@ -18,6 +20,7 @@ from src.services.screening.models import Pick
 logger = logging.getLogger(__name__)
 
 DSA_PROVIDER_MAX_CANDIDATES = 5
+DSA_PROVIDER_MAX_WORKERS = 3
 
 
 def apply_dsa_provider_context(
@@ -35,11 +38,40 @@ def apply_dsa_provider_context(
     if limit <= 0:
         return []
 
+    targets = picks[:limit]
+    payloads: list[dict[str, Any] | None] = [None] * limit
+    fetch_errors: list[Exception | None] = [None] * limit
+
+    def fetch_one(pick: Pick) -> dict[str, Any]:
+        return _fetch_candidate_context(provider, pick)
+
+    worker_count = min(DSA_PROVIDER_MAX_WORKERS, limit)
+    if worker_count <= 1:
+        try:
+            payloads[0] = fetch_one(targets[0])
+        except Exception as exc:  # noqa: BLE001
+            fetch_errors[0] = exc
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="screening-dsa") as executor:
+            futures = {}
+            for index, pick in enumerate(targets):
+                thread_context = contextvars.copy_context()
+                futures[executor.submit(thread_context.run, fetch_one, pick)] = index
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    payloads[index] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    fetch_errors[index] = exc
+
     enriched_count = 0
     errors: list[str] = []
-    for pick in picks[:limit]:
+    for index, pick in enumerate(targets):
         try:
-            payload = _fetch_candidate_context(provider, pick)
+            fetch_error = fetch_errors[index]
+            if fetch_error is not None:
+                raise fetch_error
+            payload = payloads[index]
             if not payload:
                 continue
             normalized = _normalize_candidate_payload(payload, pick)

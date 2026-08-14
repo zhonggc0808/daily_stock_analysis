@@ -82,6 +82,12 @@ const settingsHelpZhCN: SettingsHelpMap = {
     usage: '默认 300 秒，主要用于本地 CLI 这类命令行生成方式。',
     valueNotes: ['超时后会停止本次生成，并在日志里记录明确的超时错误。'],
   },
+  'settings.ai_model.ANALYSIS_LLM_TIMEOUT_SEC': {
+    title: '个股分析模型超时（秒）',
+    summary: '限制一次个股分析在模型生成阶段的整体等待时间。',
+    usage: '默认 120 秒，由主模型、备用模型、流式降级和报告完整性重试共同使用。',
+    valueNotes: ['预算耗尽后本次分析会明确超时，不会为备用模型或完整性重试重新计算完整等待时间。'],
+  },
   'settings.ai_model.GENERATION_BACKEND_MAX_OUTPUT_BYTES': {
     title: '最大输出大小（字节）',
     summary: '限制一次本地命令行生成可读取的输出大小。',
@@ -1309,6 +1315,12 @@ const settingsHelpEnUS: SettingsHelpMap = {
     summary: 'Limits how long one model generation may wait.',
     usage: 'Default is 300 seconds. This mainly applies to local CLI generation.',
     valueNotes: ['Timeout stops the generation and records a clear timeout error.'],
+  },
+  'settings.ai_model.ANALYSIS_LLM_TIMEOUT_SEC': {
+    title: 'Stock Analysis LLM Timeout (Seconds)',
+    summary: 'Limits the total model-generation wait for one stock analysis.',
+    usage: 'Default is 120 seconds, shared by the primary model, fallback models, stream recovery, and report-integrity retries.',
+    valueNotes: ['When the budget is exhausted, the analysis times out instead of granting each fallback or integrity retry a fresh full timeout.'],
   },
   'settings.ai_model.GENERATION_BACKEND_MAX_OUTPUT_BYTES': {
     title: 'Maximum Output Size (Bytes)',

@@ -12,7 +12,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -2625,6 +2625,131 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         dsa_history_mock.assert_called_once_with("600519", lookback_days=20)
         original_daily_fetch.assert_not_called()
         self.assertIs(daily_module.fetch_daily_history, builtin_daily_fetch)
+
+    def test_dsa_daily_history_uses_effective_trading_date(self) -> None:
+        expected_date = date(2026, 8, 14)
+
+        with (
+            patch(
+                "src.core.trading_calendar.get_effective_trading_date",
+                return_value=expected_date,
+            ) as effective_date_mock,
+            patch(
+                "src.services.history_loader.load_history_df",
+                return_value=(pd.DataFrame({"close": [10.0]}), "db_cache"),
+            ) as load_history_mock,
+        ):
+            _df, source = screening_service.get_dsa_daily_history(
+                "SH600519",
+                lookback_days=20,
+            )
+
+        self.assertEqual(source, "db_cache")
+        effective_date_mock.assert_called_once_with("cn")
+        load_history_mock.assert_called_once_with(
+            "600519",
+            days=30,
+            target_date=expected_date,
+        )
+
+    def test_screening_context_reuses_candidate_context_per_request(self) -> None:
+        with patch(
+            "src.services.screening_service.get_dsa_candidate_context",
+            return_value={"enriched": True, "quote": {"price": 10.0}},
+        ) as candidate_context_mock:
+            context = screening_service._build_screening_context(Config())
+            getter = context["dsa"]["get_candidate_context"]
+            first = getter("600519", "贵州茅台")
+            first["quote"]["price"] = 99.0
+            second = getter("600519", "")
+
+        self.assertEqual(second["quote"]["price"], 10.0)
+        candidate_context_mock.assert_called_once()
+
+    def test_screening_context_coalesces_concurrent_candidate_requests(self) -> None:
+        def load_context(*_args, **_kwargs):
+            time.sleep(0.03)
+            return {"enriched": True, "quote": {"price": 10.0}}
+
+        with patch(
+            "src.services.screening_service.get_dsa_candidate_context",
+            side_effect=load_context,
+        ) as candidate_context_mock:
+            context = screening_service._build_screening_context(Config())
+            getter = context["dsa"]["get_candidate_context"]
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                results = list(
+                    executor.map(
+                        lambda _index: getter("600519", "贵州茅台"),
+                        range(3),
+                    )
+                )
+
+        self.assertEqual([item["quote"]["price"] for item in results], [10.0] * 3)
+        self.assertEqual(len({id(item) for item in results}), 3)
+        candidate_context_mock.assert_called_once()
+
+    def test_dsa_candidate_quote_and_fundamentals_are_fetched_concurrently(self) -> None:
+        active = 0
+        peak_active = 0
+        lock = threading.Lock()
+
+        def track(value):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return value
+
+        fake_manager = SimpleNamespace(get_stock_name=MagicMock(return_value="贵州茅台"))
+        with (
+            patch("src.services.screening_service._get_dsa_fetcher_manager", return_value=fake_manager),
+            patch(
+                "src.services.screening_service.get_dsa_realtime_quote",
+                side_effect=lambda _code: track({"price": 1688.0}),
+            ),
+            patch(
+                "src.services.screening_service.get_dsa_fundamental_context",
+                side_effect=lambda _code: track({"market": "cn"}),
+            ),
+        ):
+            context = screening_service.get_dsa_candidate_context("600519", "贵州茅台")
+
+        self.assertEqual(peak_active, 2)
+        self.assertEqual(context["quote"]["price"], 1688.0)
+        self.assertEqual(context["fundamentals"]["market"], "cn")
+
+    def test_post_rank_dsa_enrichment_preserves_order_while_fetching_concurrently(self) -> None:
+        active = 0
+        peak_active = 0
+        lock = threading.Lock()
+
+        def build_context(candidate, **_kwargs):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return {
+                "dsa_context": {"enriched": True, "quote": {"price": 10.0}},
+                "dsa_news": [{"title": candidate["code"]}],
+            }
+
+        candidates = [{"code": code, "name": code} for code in ("000001", "000002", "000003")]
+        with patch(
+            "src.services.screening_service._build_dsa_candidate_context",
+            side_effect=build_context,
+        ):
+            enriched, metadata = screening_service._enrich_candidates_with_dsa(candidates)
+
+        self.assertEqual(peak_active, 3)
+        self.assertEqual([item["code"] for item in enriched], ["000001", "000002", "000003"])
+        self.assertEqual(metadata["enriched_count"], 3)
 
     def test_screen_enriches_top_candidates_with_dsa_context(self) -> None:
         config = self._config(enabled=True)

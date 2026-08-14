@@ -411,6 +411,7 @@ class TestSettingsHelpMetadata(unittest.TestCase):
         "REPORT_RENDERER_ENABLED",
         "REPORT_INTEGRITY_ENABLED",
         "REPORT_INTEGRITY_RETRY",
+        "ANALYSIS_LLM_TIMEOUT_SEC",
         "REPORT_HISTORY_COMPARE_N",
         "SINGLE_STOCK_NOTIFY",
         "MERGE_EMAIL_NOTIFICATION",

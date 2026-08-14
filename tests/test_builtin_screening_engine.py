@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
@@ -573,20 +574,21 @@ def test_dsa_provider_context_respects_host_max_candidates_setting() -> None:
 
     def get_candidate_context(code: str, _name: str) -> dict[str, object]:
         requested_codes.append(code)
-        return {"enriched": True, "quote": {"price": 10.0}}
+        return {"enriched": True, "quote": {"price": float(code)}}
 
     notes = apply_dsa_provider_context(
         picks,
         {"dsa": {"max_candidates": 3, "get_candidate_context": get_candidate_context}},
     )
 
-    assert requested_codes == ["000001", "000002", "000003"]
+    assert set(requested_codes) == {"000001", "000002", "000003"}
+    assert [pick.dsa_context["quote"]["price"] for pick in picks[:3]] == [1.0, 2.0, 3.0]
     assert all(pick.dsa_context.get("enriched") is True for pick in picks[:3])
     assert all(pick.dsa_context == {} for pick in picks[3:])
     assert notes == ["DSA provider context applied 3 of 3 candidates"]
 
 
-def test_dsa_provider_context_calls_host_provider_sequentially() -> None:
+def test_dsa_provider_context_fetches_candidates_with_bounded_concurrency() -> None:
     picks = [
         Pick(
             rank=index + 1,
@@ -598,14 +600,19 @@ def test_dsa_provider_context_calls_host_provider_sequentially() -> None:
         for index in range(3)
     ]
     requested_codes: list[str] = []
-    active = False
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
 
     def get_candidate_context(code: str, _name: str) -> dict[str, object]:
-        nonlocal active
-        assert active is False
-        active = True
-        requested_codes.append(code)
-        active = False
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            requested_codes.append(code)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
         return {"enriched": True, "quote": {"price": 10.0}}
 
     notes = apply_dsa_provider_context(
@@ -613,7 +620,8 @@ def test_dsa_provider_context_calls_host_provider_sequentially() -> None:
         {"dsa": {"get_candidate_context": get_candidate_context}},
     )
 
-    assert requested_codes == ["000001", "000002", "000003"]
+    assert set(requested_codes) == {"000001", "000002", "000003"}
+    assert peak_active == 3
     assert notes == ["DSA provider context applied 3 of 3 candidates"]
 
 

@@ -71,7 +71,22 @@ _CATEGORY_DEFINITIONS: List[Dict[str, Any]] = [
 ]
 
 WEB_SETTINGS_HIDDEN_FROM_UI = {
+    # Advanced performance tuning remains deployment-managed. Exposing these
+    # values in the Web UI could bypass process-level concurrency/cache guards.
+    "ANALYSIS_GLOBAL_IO_LIMIT",
+    "ANALYSIS_IO_MAX_CONCURRENCY",
+    "ANALYSIS_PARALLEL_IO_ENABLED",
+    "CHIP_CACHE_TTL_SECONDS",
+    "CHIP_FAILURE_CACHE_TTL_SECONDS",
+    "CN_DAILY_SOURCE_PRIORITY",
     "DATABASE_PATH",
+    "FUNDAMENTAL_CACHE_TTL_SECONDS",
+    "MARKET_STRUCTURE_CACHE_TTL_SECONDS",
+    "NEWS_INTEL_CACHE_TTL_SECONDS",
+    "NEWS_SEARCH_MAX_CONCURRENCY",
+    "REALTIME_CACHE_TTL",
+    "REALTIME_CLOSED_CACHE_TTL",
+    "SEARCH_PROVIDER_COOLDOWN_SECONDS",
     "SQLITE_WAL_ENABLED",
     "SQLITE_BUSY_TIMEOUT_MS",
     "SQLITE_WRITE_RETRY_MAX",
@@ -220,6 +235,32 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
                 "label": "LLM 配置指南",
                 "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
             },
+        ],
+        "warning_codes": [],
+    },
+    "ANALYSIS_LLM_TIMEOUT_SEC": {
+        "title": "Stock Analysis LLM Timeout",
+        "description": (
+            "End-to-end timeout in seconds shared by the primary model, fallback models, "
+            "and report-integrity retries for one stock analysis."
+        ),
+        "category": "ai_model",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "120",
+        "options": [],
+        "validation": {"min": 1, "max": 1800},
+        "display_order": 1,
+        "help_key": "settings.ai_model.ANALYSIS_LLM_TIMEOUT_SEC",
+        "examples": ["ANALYSIS_LLM_TIMEOUT_SEC=120"],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            }
         ],
         "warning_codes": [],
     },

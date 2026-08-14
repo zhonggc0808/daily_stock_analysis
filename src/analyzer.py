@@ -3119,6 +3119,17 @@ class GeminiAnalyzer:
         )
         requested_temperature = generation_config.get('temperature', 0.7)
         requested_timeout = generation_config.get("timeout")
+        call_deadline: Optional[float] = None
+        if requested_timeout not in (None, ""):
+            call_deadline = time.monotonic() + max(float(requested_timeout), 0.001)
+
+        def remaining_timeout() -> Optional[float]:
+            if call_deadline is None:
+                return None
+            remaining = call_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("analysis LLM deadline exhausted")
+            return max(remaining, 0.001)
 
         models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]
@@ -3174,8 +3185,9 @@ class GeminiAnalyzer:
                     ],
                     "max_tokens": max_tokens,
                 }
-                if requested_timeout not in (None, ""):
-                    call_kwargs["timeout"] = requested_timeout
+                effective_timeout = remaining_timeout()
+                if effective_timeout is not None:
+                    call_kwargs["timeout"] = effective_timeout
                 if extra:
                     call_kwargs["extra_body"] = extra
                 uses_router = (
@@ -3208,8 +3220,9 @@ class GeminiAnalyzer:
                 )
                 hint_result = apply_prompt_cache_hints(call_kwargs, route_context, config)
                 call_kwargs = hint_result.call_kwargs
-                if requested_timeout not in (None, ""):
-                    call_kwargs["timeout"] = requested_timeout
+                effective_timeout = remaining_timeout()
+                if effective_timeout is not None:
+                    call_kwargs["timeout"] = effective_timeout
                 if hint_result.diagnostics:
                     logger.debug("[PromptCache] %s", hint_result.diagnostics)
 
@@ -3218,6 +3231,10 @@ class GeminiAnalyzer:
 
                 if model_stream:
                     try:
+                        stream_kwargs = {**call_kwargs, "stream": True}
+                        effective_timeout = remaining_timeout()
+                        if effective_timeout is not None:
+                            stream_kwargs["timeout"] = effective_timeout
                         stream_response = call_litellm_with_param_recovery(
                             lambda kwargs: self._dispatch_litellm_completion(
                                 model,
@@ -3227,7 +3244,7 @@ class GeminiAnalyzer:
                                 router_model_names=router_model_names,
                             ),
                             model=model,
-                            call_kwargs={**call_kwargs, "stream": True},
+                            call_kwargs=stream_kwargs,
                             model_list=recovery_model_list,
                             cache_recovery=False,
                             logger=logger,
@@ -3271,6 +3288,9 @@ class GeminiAnalyzer:
                         response_validator(_stream_text)
                     return _stream_text, model, _stream_usage
 
+                effective_timeout = remaining_timeout()
+                if effective_timeout is not None:
+                    call_kwargs["timeout"] = effective_timeout
                 response = call_litellm_with_param_recovery(
                     lambda kwargs: self._dispatch_litellm_completion(
                         model,
@@ -3546,6 +3566,11 @@ class GeminiAnalyzer:
                 "temperature": config.llm_temperature,
                 "max_output_tokens": 8192,
             }
+            llm_timeout_seconds = max(
+                float(getattr(config, "analysis_llm_timeout_seconds", 120.0)),
+                1.0,
+            )
+            llm_deadline = time.monotonic() + llm_timeout_seconds
 
             logger.info(f"[LLM调用] 开始调用 {model_name}...")
             _emit_progress(68, f"{name}：LLM 已接收请求，等待响应")
@@ -3558,9 +3583,14 @@ class GeminiAnalyzer:
             while True:
                 start_time = time.time()
                 try:
+                    remaining_seconds = llm_deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError(
+                            f"analysis LLM deadline exhausted after {llm_timeout_seconds:.1f}s"
+                        )
                     response_text, model_used, llm_usage = self._call_litellm(
                         current_prompt,
-                        generation_config,
+                        {**generation_config, "timeout": remaining_seconds},
                         system_prompt=system_prompt,
                         stream=True,
                         stream_progress_callback=stream_progress_callback,

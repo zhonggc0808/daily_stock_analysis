@@ -116,6 +116,9 @@ class AnalysisService:
                 analysis_skills=skills,
                 analysis_phase=analysis_phase,
                 portfolio_context=portfolio_context,
+                # API requests reuse a prepared same-day market review but do not
+                # generate one on the latency-sensitive single-stock path.
+                daily_market_context_allow_generate=False,
             )
             
             # 确定报告类型 (API: simple/detailed/full/brief -> ReportType)

@@ -17,6 +17,20 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_analysis_llm_timeout_is_configurable_and_bounded(
+        self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(os.environ, {"ANALYSIS_LLM_TIMEOUT_SEC": "45.5"}, clear=True):
+            configured = Config._load_from_env()
+        with patch.dict(os.environ, {"ANALYSIS_LLM_TIMEOUT_SEC": "9999"}, clear=True):
+            bounded = Config._load_from_env()
+
+        self.assertEqual(configured.analysis_llm_timeout_seconds, 45.5)
+        self.assertEqual(bounded.analysis_llm_timeout_seconds, 1800.0)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
     def test_share_image_social_branding_is_optional_and_configurable(
         self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env
     ):
