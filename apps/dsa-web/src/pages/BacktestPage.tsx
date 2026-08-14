@@ -205,9 +205,9 @@ const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; la
       <div className="flex items-center justify-between">
         <span className="text-xs text-muted-text">{text.outcomeSummary}</span>
         <span className="text-xs font-mono">
-          <span className="text-success">{metrics.winCount}</span>
+          <span className="text-price-up">{metrics.winCount}</span>
           {' / '}
-          <span className="text-danger">{metrics.lossCount}</span>
+          <span className="text-price-down">{metrics.lossCount}</span>
           {' / '}
           <span className="text-warning">{metrics.neutralCount}</span>
         </span>
@@ -681,7 +681,7 @@ const BacktestPage: React.FC = () => {
                               {actualMovementBadge(row.actualMovement, language)}
                               <span className={
                                 row.actualReturnPct != null
-                                  ? row.actualReturnPct > 0 ? 'text-success' : row.actualReturnPct < 0 ? 'text-danger' : 'text-secondary-text'
+                                  ? row.actualReturnPct > 0 ? 'text-price-up' : row.actualReturnPct < 0 ? 'text-price-down' : 'text-secondary-text'
                                   : 'text-muted-text'
                               }>
                                 {pct(row.actualReturnPct)}

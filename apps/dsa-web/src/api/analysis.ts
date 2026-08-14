@@ -127,11 +127,13 @@ export const analysisApi = {
   /**
    * Get async task status.
    * @param taskId Task ID
+   * @param options Optional request options including AbortSignal
    */
-  getStatus: async (taskId: string): Promise<TaskStatus> => {
-    const response = await apiClient.get<Record<string, unknown>>(
-      `/api/v1/analysis/status/${taskId}`
-    );
+  getStatus: async (taskId: string, options?: { signal?: AbortSignal }): Promise<TaskStatus> => {
+    const config = options?.signal ? { signal: options.signal } : undefined;
+    const response = await (config
+      ? apiClient.get<Record<string, unknown>>(`/api/v1/analysis/status/${taskId}`, config)
+      : apiClient.get<Record<string, unknown>>(`/api/v1/analysis/status/${taskId}`));
 
     const data = toCamelCase<TaskStatus>(response.data);
 

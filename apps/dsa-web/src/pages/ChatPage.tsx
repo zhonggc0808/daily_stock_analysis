@@ -1,12 +1,11 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import Markdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { ChevronDown, SlidersHorizontal } from 'lucide-react';
 import { cn } from '../utils/cn';
 import { agentApi } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, ScrollArea, Tooltip } from '../components/common';
+import { ChatMessage } from '../components/chat';
 import { createParsedApiError, getParsedApiError } from '../api/error';
 import type { AgentStatusResponse, SkillInfo } from '../api/agent';
 import { DashboardStateBlock } from '../components/dashboard';
@@ -27,7 +26,7 @@ import {
 import { isNearBottom } from '../utils/chatScroll';
 import { getReportText } from '../utils/reportLanguage';
 import { extractStockCodesFromMessage } from '../utils/chatStockCode';
-import { findMatchingStockCode, includesStockCode, normalizeStockCode } from '../utils/stockCode';
+import { areStockCodesEquivalent, findMatchingStockCode, includesStockCode, normalizeStockCode } from '../utils/stockCode';
 import { useStockIndex } from '../hooks/useStockIndex';
 import type { StockIndexItem } from '../types/stockIndex';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
@@ -338,6 +337,20 @@ const ChatPage: React.FC = () => {
     },
     [isWatchlistActioning, watchlistCodes],
   );
+
+  const handleAnalyzeReferencedStock = useCallback((stockCode: string) => {
+    const stock = stockIndex.find((item) => (
+      item.active && areStockCodesEquivalent(item.canonicalCode, stockCode)
+    ));
+    navigate('/', {
+      state: {
+        stockCode,
+        stockName: stock?.nameZh || stock?.nameEn || stockCode,
+        autoAnalyze: true,
+        selectionSource: 'chat_reference',
+      },
+    });
+  }, [navigate, stockIndex]);
 
   const {
     messages,
@@ -1294,95 +1307,29 @@ const ChatPage: React.FC = () => {
             ) : (
               messages.map((msg) => {
                 const skillLabel = getMessageSkillLabel(msg);
+                const backendBadgeText = msg.backend
+                  ? t(msg.backend === 'codex_app_server' ? 'chat.codexBackendBadge' : 'chat.defaultBackendBadge')
+                  : null;
+
                 return (
-                <div
-                  key={msg.id}
-                  className={`flex gap-4 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}
-                >
-                  <div
-                    className={cn(
-                      'flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[10px] font-bold shadow-sm transition-all',
-                      msg.role === 'user' ? 'chat-avatar-user' : 'chat-avatar-ai'
-                    )}
-                  >
-                    {msg.role === 'user' ? 'U' : 'AI'}
-                  </div>
-                  <div
-                    className={cn(
-                      'group/message min-w-0 w-fit max-w-[min(100%,48rem)] overflow-hidden px-5 py-3.5 transition-colors',
-                      msg.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'
-                    )}
-                  >
-                    {msg.role === 'assistant' && (skillLabel || msg.backend) && (
-                      <div className="mb-2 flex flex-wrap gap-2">
-                        {skillLabel ? <Badge variant="info" className="chat-skill-badge shadow-none" aria-label={`技能 ${skillLabel}`}>
-                          <svg
-                            className="w-3 h-3"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={2}
-                              d="M13 10V3L4 14h7v7l9-11h-7z"
-                            />
-                          </svg>
-                          {skillLabel}
-                        </Badge> : null}
-                        {msg.backend ? (
-                          <Badge variant={msg.backend === 'codex_app_server' ? 'warning' : 'history'} size="sm">
-                            {t(msg.backend === 'codex_app_server' ? 'chat.codexBackendBadge' : 'chat.defaultBackendBadge')}
-                          </Badge>
-                        ) : null}
-                      </div>
-                    )}
-                    {msg.role === 'assistant' && renderThinkingBlock(msg)}
-                    {msg.role === 'assistant' &&
-                      expandedThinking.has(msg.id) &&
-                      msg.thinkingSteps &&
-                      renderThinkingDetails(msg.thinkingSteps)}
-                    {msg.role === 'assistant' ? (
-                      <div className="relative">
-                        <div className="chat-message-actions">
-                          <button
-                            type="button"
-                            onClick={() => copyMessageToClipboard(msg.id, msg.content)}
-                            className="chat-copy-btn"
-                            aria-label={copiedMessages.has(msg.id) ? text.copied : text.copy}
-                          >
-                            {copiedMessages.has(msg.id) ? text.copied : text.copy}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => downloadMessageAsMarkdown(msg)}
-                            className="chat-copy-btn"
-                            aria-label="导出此条消息为 Markdown"
-                          >
-                            导出
-                          </button>
-                        </div>
-                        <div className="chat-prose pr-20 sm:pr-24">
-                          <Markdown remarkPlugins={[remarkGfm]}>
-                            {msg.content}
-                          </Markdown>
-                        </div>
-                      </div>
-                    ) : (
-                      msg.content
-                        .split('\n')
-                        .map((line, i) => (
-                          <p
-                            key={i}
-                            className="mb-1 last:mb-0 leading-relaxed"
-                          >
-                            {line || '\u00A0'}
-                          </p>
-                        ))
-                    )}
-                  </div>
-                </div>
+                  <ChatMessage
+                    key={msg.id}
+                    msg={msg}
+                    skillLabel={skillLabel}
+                    backendBadgeText={backendBadgeText}
+                    isExpandedThinking={expandedThinking.has(msg.id)}
+                    copied={copiedMessages.has(msg.id)}
+                    copyLabel={text.copy}
+                    copiedLabel={text.copied}
+                    stockIndex={stockIndex}
+                    isStockInWatchlist={stockInWatchlist}
+                    onCopy={copyMessageToClipboard}
+                    onExport={downloadMessageAsMarkdown}
+                    onAnalyzeStock={handleAnalyzeReferencedStock}
+                    onToggleWatchlist={handleToggleWatchlist}
+                    renderThinkingBlock={renderThinkingBlock}
+                    renderThinkingDetails={renderThinkingDetails}
+                  />
                 );
               })
             )}

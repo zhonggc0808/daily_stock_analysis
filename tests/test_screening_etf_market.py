@@ -484,10 +484,12 @@ def test_api_normalization_keeps_additive_etf_fields_and_supported_market():
             "fund_type": "指数型-股票", "fund_size": 12_000_000_000,
             "theme_key": "semiconductor", "theme_name": "半导体",
             "bid_ask_spread_bps": 2.5, "universe_mode": "authoritative",
+            "action": "watch",
         },
         1,
     )
     assert candidate["asset_type"] == "etf"
     assert candidate["theme_name"] == "半导体"
     assert candidate["bid_ask_spread_bps"] == 2.5
+    assert candidate["signal"] == "watch"
     assert _call_screening_status()["supported_markets"] == ["cn", "cn_etf"]

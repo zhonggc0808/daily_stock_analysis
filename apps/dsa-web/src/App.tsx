@@ -8,6 +8,7 @@ import {
   StandaloneRouteBoundary,
 } from './components/layout/RouteBoundary';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { MarketColorProvider } from './contexts/MarketColorContext';
 import { UiLanguageProvider, useUiLanguage } from './contexts/UiLanguageContext';
 import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
@@ -97,11 +98,13 @@ const AppContent: React.FC = () => {
 const App: React.FC = () => {
   return (
     <UiLanguageProvider>
-      <Router>
-        <AuthProvider>
-          <AppContent />
-        </AuthProvider>
-      </Router>
+      <MarketColorProvider>
+        <Router>
+          <AuthProvider>
+            <AppContent />
+          </AuthProvider>
+        </Router>
+      </MarketColorProvider>
     </UiLanguageProvider>
   );
 };

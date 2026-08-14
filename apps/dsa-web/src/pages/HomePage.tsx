@@ -24,6 +24,7 @@ import {
   type WatchlistAnalyzeMode,
 } from '../components/watchlist/HomeStockWorkspace';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
+import { isAbortOrCanceledError } from '../hooks/useVisibilityAwarePolling';
 import { useWatchlist } from '../hooks/useWatchlist';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import type { SetupStatusResponse } from '../types/systemConfig';
@@ -282,7 +283,10 @@ const HomePage: React.FC = () => {
     new Map(),
   );
   const duplicateBannerTimer = useRef<number | null>(null);
-  const marketReviewPollTimer = useRef<number | null>(null);
+  const marketReviewPollTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const marketReviewAbortControllerRef = useRef<AbortController | null>(null);
+  const marketReviewVisibilityCleanupRef = useRef<(() => void) | null>(null);
+  const marketReviewGenerationRef = useRef<number>(0);
   const stockBarLoadStartedRef = useRef(false);
   const taskPanelPreferenceSettledRef = useRef(readTaskPanelCollapsedPreference() !== null);
   const dashboardScrollRef = useRef<HTMLElement | null>(null);
@@ -292,9 +296,16 @@ const HomePage: React.FC = () => {
   const strategyInitialFocusIndexRef = useRef<number | null>(null);
 
   const stopMarketReviewPolling = useCallback(() => {
+    marketReviewGenerationRef.current += 1;
+    marketReviewVisibilityCleanupRef.current?.();
+    marketReviewVisibilityCleanupRef.current = null;
     if (marketReviewPollTimer.current !== null) {
-      window.clearInterval(marketReviewPollTimer.current);
+      window.clearTimeout(marketReviewPollTimer.current);
       marketReviewPollTimer.current = null;
+    }
+    if (marketReviewAbortControllerRef.current) {
+      marketReviewAbortControllerRef.current.abort();
+      marketReviewAbortControllerRef.current = null;
     }
   }, []);
 
@@ -924,11 +935,38 @@ const HomePage: React.FC = () => {
     async (taskId: string) => {
       stopMarketReviewPolling();
 
+      const expectedGeneration = ++marketReviewGenerationRef.current;
       const maxAttempts = 120;
       const intervalMs = 2000;
       let attempts = 0;
+      let inFlight = false;
+      let syncWhenIdle = false;
 
-      const poll = async (): Promise<boolean> => {
+      const scheduleNext = () => {
+        if (
+          expectedGeneration !== marketReviewGenerationRef.current ||
+          document.visibilityState === 'hidden'
+        ) {
+          return;
+        }
+        marketReviewPollTimer.current = window.setTimeout(() => {
+          void poll();
+        }, intervalMs);
+      };
+
+      const poll = async (): Promise<void> => {
+        if (expectedGeneration !== marketReviewGenerationRef.current) {
+          return;
+        }
+        if (document.visibilityState === 'hidden') {
+          return;
+        }
+        if (inFlight) {
+          syncWhenIdle = true;
+          return;
+        }
+        inFlight = true;
+
         if (attempts >= maxAttempts) {
           stopMarketReviewPolling();
           setMarketReviewReport(null);
@@ -939,13 +977,19 @@ const HomePage: React.FC = () => {
             message: t('home.marketReviewTimeoutMessage'),
           });
           scrollMarketReviewFeedbackIntoView();
-          return false;
+          return;
         }
 
         attempts += 1;
+        const controller = new AbortController();
+        marketReviewAbortControllerRef.current = controller;
 
         try {
-          const status = await analysisApi.getStatus(taskId);
+          const status = await analysisApi.getStatus(taskId, { signal: controller.signal });
+          if (expectedGeneration !== marketReviewGenerationRef.current) {
+            return;
+          }
+
           if (status.status === 'pending' || status.status === 'processing') {
             setMarketReviewReport(null);
             setMarketReviewPayload(null);
@@ -959,7 +1003,8 @@ const HomePage: React.FC = () => {
                 ? t('home.taskStatusWithRegion', { status: status.status, progress, region: status.region })
                 : t('home.taskStatus', { status: status.status, progress }),
             });
-            return true;
+            scheduleNext();
+            return;
           }
 
           if (status.status === 'completed') {
@@ -977,7 +1022,7 @@ const HomePage: React.FC = () => {
             setMarketReviewError(null);
             await refreshMarketReviewHistory(true);
             scrollMarketReviewFeedbackIntoView();
-            return false;
+            return;
           }
 
           if (status.status === 'failed') {
@@ -997,7 +1042,7 @@ const HomePage: React.FC = () => {
             );
             setMarketReviewNotice(null);
             scrollMarketReviewFeedbackIntoView();
-            return false;
+            return;
           }
 
           stopMarketReviewPolling();
@@ -1009,8 +1054,11 @@ const HomePage: React.FC = () => {
             message: t('home.unknownTaskStatus', { status: status.status }),
           });
           scrollMarketReviewFeedbackIntoView();
-          return false;
+          return;
         } catch (err: unknown) {
+          if (expectedGeneration !== marketReviewGenerationRef.current || isAbortOrCanceledError(err)) {
+            return;
+          }
           const parsed = getParsedApiError(err);
           if (attempts >= maxAttempts) {
             stopMarketReviewPolling();
@@ -1019,23 +1067,46 @@ const HomePage: React.FC = () => {
             setMarketReviewError(parsed);
             setMarketReviewNotice(null);
             scrollMarketReviewFeedbackIntoView();
-            return false;
+            return;
           }
-          return true;
+          scheduleNext();
+        } finally {
+          inFlight = false;
+          if (marketReviewAbortControllerRef.current === controller) {
+            marketReviewAbortControllerRef.current = null;
+          }
+          if (
+            syncWhenIdle &&
+            expectedGeneration === marketReviewGenerationRef.current &&
+            document.visibilityState === 'visible'
+          ) {
+            syncWhenIdle = false;
+            void poll();
+          }
         }
-
-        return true;
       };
 
-      if (await poll()) {
-        marketReviewPollTimer.current = window.setInterval(() => {
-          void poll().then((shouldContinue) => {
-            if (!shouldContinue) {
-              stopMarketReviewPolling();
-            }
-          });
-        }, intervalMs);
-      }
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === 'hidden') {
+          if (marketReviewPollTimer.current !== null) {
+            window.clearTimeout(marketReviewPollTimer.current);
+            marketReviewPollTimer.current = null;
+          }
+          marketReviewAbortControllerRef.current?.abort();
+          return;
+        }
+        if (inFlight) {
+          syncWhenIdle = true;
+          return;
+        }
+        void poll();
+      };
+
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      marketReviewVisibilityCleanupRef.current = () => {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
+      void poll();
     },
     [refreshMarketReviewHistory, scrollMarketReviewFeedbackIntoView, stopMarketReviewPolling, t],
   );
@@ -1691,7 +1762,7 @@ const HomePage: React.FC = () => {
                 <DashboardStateBlock title={t('home.loadingReport')} loading />
               </div>
             ) : !marketReviewReport && selectedReport ? (
-              <div className={isHistoryTrendOpen ? 'max-w-6xl space-y-4 pb-8' : 'max-w-4xl space-y-4 pb-8'}>
+              <div className="max-w-6xl space-y-4 pb-8">
                 <div className="flex flex-wrap items-center justify-end gap-2">
                   {!isMarketReviewHistoryReport ? (
                     <>

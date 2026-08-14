@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, ChevronDown, CircleAlert, CircleDashed, Clock, Play, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useAuth, useSystemConfig } from '../hooks';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { useMarketColorMode } from '../contexts/MarketColorContext';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
 import { screeningApi, notifyScreeningConfigChanged, notifySystemConfigChanged } from '../api/screening';
@@ -847,6 +848,74 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
         {!runNowError && runNowSuccess ? (
           <SettingsAlert title={t('settings.actionSuccess')} message={runNowSuccess} variant="success" />
         ) : null}
+      </div>
+    </SettingsSectionCard>
+  );
+};
+
+const MarketColorSettingsCard: React.FC = () => {
+  const { marketColorMode, setMarketColorMode } = useMarketColorMode();
+  const { t } = useUiLanguage();
+
+  return (
+    <SettingsSectionCard
+      title={t('settings.marketColorTitle')}
+      description={t('settings.marketColorDescription')}
+    >
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <button
+          type="button"
+          aria-pressed={marketColorMode === 'cn'}
+          onClick={() => setMarketColorMode('cn')}
+          className={`flex flex-col items-start gap-2 rounded-2xl border p-4 text-left transition-all ${
+            marketColorMode === 'cn'
+              ? 'border-primary bg-primary/10 shadow-sm'
+              : 'settings-border bg-background/35 hover:border-subtle-hover'
+          }`}
+        >
+          <div className="flex w-full items-center justify-between">
+            <span className="font-semibold text-foreground">{t('settings.marketColorCnTitle')}</span>
+            {marketColorMode === 'cn' ? (
+              <span className="h-2.5 w-2.5 rounded-full bg-primary" />
+            ) : null}
+          </div>
+          <p className="text-xs text-secondary-text">{t('settings.marketColorCnDescription')}</p>
+          <div className="mt-1 flex items-center gap-3 text-xs font-mono">
+            <span className="inline-flex items-center gap-1 font-semibold text-red-500">
+              {t('settings.marketColorUpExample')}
+            </span>
+            <span className="inline-flex items-center gap-1 font-semibold text-emerald-500">
+              {t('settings.marketColorDownExample')}
+            </span>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          aria-pressed={marketColorMode === 'international'}
+          onClick={() => setMarketColorMode('international')}
+          className={`flex flex-col items-start gap-2 rounded-2xl border p-4 text-left transition-all ${
+            marketColorMode === 'international'
+              ? 'border-primary bg-primary/10 shadow-sm'
+              : 'settings-border bg-background/35 hover:border-subtle-hover'
+          }`}
+        >
+          <div className="flex w-full items-center justify-between">
+            <span className="font-semibold text-foreground">{t('settings.marketColorInternationalTitle')}</span>
+            {marketColorMode === 'international' ? (
+              <span className="h-2.5 w-2.5 rounded-full bg-primary" />
+            ) : null}
+          </div>
+          <p className="text-xs text-secondary-text">{t('settings.marketColorInternationalDescription')}</p>
+          <div className="mt-1 flex items-center gap-3 text-xs font-mono">
+            <span className="inline-flex items-center gap-1 font-semibold text-emerald-500">
+              {t('settings.marketColorUpExample')}
+            </span>
+            <span className="inline-flex items-center gap-1 font-semibold text-red-500">
+              {t('settings.marketColorDownExample')}
+            </span>
+          </div>
+        </button>
       </div>
     </SettingsSectionCard>
   );
@@ -1775,6 +1844,7 @@ const SettingsPage: React.FC = () => {
                 </div>
               </SettingsSectionCard>
             ) : null}
+            {activeCategory === 'base' ? <MarketColorSettingsCard /> : null}
             {activeCategory === 'base' ? (
               <SettingsSectionCard
                 title={t('settings.intelligentImport')}

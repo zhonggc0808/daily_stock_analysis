@@ -3982,6 +3982,7 @@ def _normalize_candidate(raw: Any, rank: int) -> Dict[str, Any]:
         "score": _first_present(item, source, "score", "final_score"),
         "screen_score": _first_present(item, source, "screen_score"),
         "reason": item.get("reason") or source.get("reason") or source.get("ranking_reason") or source.get("risk_summary") or item.get("summary") or _build_candidate_reason(source),
+        "signal": item.get("signal") or item.get("action") or item.get("recommendation") or source.get("signal") or source.get("action") or source.get("recommendation") or "",
         "risk_level": item.get("risk_level") or source.get("risk_level") or "",
         "risk_flags": item.get("risk_flags") or source.get("risk_flags") or [],
         "llm_score": _first_present(item, source, "llm_score"),

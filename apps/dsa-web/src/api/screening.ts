@@ -30,6 +30,7 @@ export type ScreeningCandidate = {
   score?: number | null;
   screenScore?: number | null;
   reason: string;
+  signal?: string;
   riskLevel?: string;
   riskFlags?: string[];
   llmScore?: number | null;
@@ -453,15 +454,30 @@ export const screeningApi = {
     return toCamelCase<ScreeningScreenAccepted>(response.data);
   },
 
-  async getScreenTask(taskId: string): Promise<ScreeningScreenTaskStatus> {
-    const response = await apiClient.get<Record<string, unknown>>(`/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}`);
+  async getScreenTask(taskId: string, options?: { signal?: AbortSignal }): Promise<ScreeningScreenTaskStatus> {
+    const config = options?.signal ? { signal: options.signal } : undefined;
+    const response = await (config
+      ? apiClient.get<Record<string, unknown>>(
+          `/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}`,
+          config,
+        )
+      : apiClient.get<Record<string, unknown>>(
+          `/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}`,
+        ));
     return toCamelCase<ScreeningScreenTaskStatus>(response.data);
   },
 
-  async cancelScreenTask(taskId: string): Promise<ScreeningScreenTaskStatus> {
-    const response = await apiClient.post<Record<string, unknown>>(
-      `/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}/cancel`,
-    );
+  async cancelScreenTask(taskId: string, options?: { signal?: AbortSignal }): Promise<ScreeningScreenTaskStatus> {
+    const config = options?.signal ? { signal: options.signal } : undefined;
+    const response = await (config
+      ? apiClient.post<Record<string, unknown>>(
+          `/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}/cancel`,
+          undefined,
+          config,
+        )
+      : apiClient.post<Record<string, unknown>>(
+          `/api/v1/screening/screen/tasks/${encodeURIComponent(taskId)}/cancel`,
+        ));
     return toCamelCase<ScreeningScreenTaskStatus>(response.data);
   },
 

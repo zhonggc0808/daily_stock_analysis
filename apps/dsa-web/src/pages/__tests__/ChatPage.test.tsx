@@ -726,6 +726,27 @@ describe('ChatPage', () => {
     expect(skillBadge).toHaveTextContent('趋势分析');
   });
 
+  it('navigates stock references through the Home analysis state contract', async () => {
+    mockStoreState.messages = [
+      { id: 'assistant-stock', role: 'assistant', content: '贵州茅台 600519 当前趋势偏强。' },
+    ];
+    const router = createMemoryRouter([
+      { path: '/chat', element: <ChatPage /> },
+      { path: '/', element: <div>Home target</div> },
+    ], { initialEntries: ['/chat'] });
+
+    render(<RouterProvider router={router} />);
+    fireEvent.click(await screen.findByRole('button', { name: '进入分析 贵州茅台' }));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe('/'));
+    expect(router.state.location.state).toEqual({
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      autoAnalyze: true,
+      selectionSource: 'chat_reference',
+    });
+  });
+
   it('renders assistant multi-skill labels with shared badge semantics', async () => {
     mockStoreState.messages = [
       {

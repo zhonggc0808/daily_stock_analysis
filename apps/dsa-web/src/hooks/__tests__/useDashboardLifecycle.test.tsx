@@ -34,7 +34,7 @@ describe('useDashboardLifecycle', () => {
     vi.useRealTimers();
   });
 
-  it('loads history, refreshes on interval, and reacts to visibility changes', () => {
+  it('loads history, refreshes on interval, and reacts to visibility changes', async () => {
     const loadInitialHistory = vi.fn().mockResolvedValue(undefined);
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
     const refreshActiveTasks = vi.fn().mockResolvedValue(undefined);
@@ -58,8 +58,9 @@ describe('useDashboardLifecycle', () => {
     expect(defaultMocks.loadMarketReviewHistory).toHaveBeenCalledTimes(1);
     expect(refreshActiveTasks).toHaveBeenCalledTimes(1);
 
-    act(() => {
+    await act(async () => {
       vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
     });
     expect(refreshHistory).toHaveBeenCalledWith(true);
     expect(defaultMocks.refreshMarketReviewHistory).toHaveBeenCalledWith(true);
@@ -69,9 +70,18 @@ describe('useDashboardLifecycle', () => {
     act(() => {
       Object.defineProperty(document, 'visibilityState', {
         configurable: true,
+        value: 'hidden',
+      });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+
+    await act(async () => {
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
         value: 'visible',
       });
       document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
     });
 
     expect(refreshHistory).toHaveBeenCalledTimes(2);

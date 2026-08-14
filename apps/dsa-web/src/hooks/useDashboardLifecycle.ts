@@ -1,6 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import type { TaskInfo } from '../types/analysis';
 import { useTaskStream } from './useTaskStream';
+import { useVisibilityAwarePolling } from './useVisibilityAwarePolling';
 
 type UseDashboardLifecycleOptions = {
   loadInitialHistory: () => Promise<void>;
@@ -52,40 +53,24 @@ export function useDashboardLifecycle({
     void refreshActiveTasks();
   }, [enabled, loadInitialHistory, loadMarketReviewHistory, loadStockBar, refreshActiveTasks]);
 
-  useEffect(() => {
-    if (!enabled) {
-      return;
-    }
+  const handlePeriodicRefresh = useCallback(async () => {
+    onDashboardDataRefresh?.();
+    await Promise.allSettled([
+      refreshHistory(true),
+      refreshStockBar(),
+      refreshMarketReviewHistory?.(true),
+      refreshActiveTasks(),
+    ]);
+  }, [onDashboardDataRefresh, refreshActiveTasks, refreshHistory, refreshMarketReviewHistory, refreshStockBar]);
 
-    const intervalId = window.setInterval(() => {
-      void refreshHistory(true);
-      void refreshStockBar();
-      void refreshMarketReviewHistory?.(true);
-      void refreshActiveTasks();
-      onDashboardDataRefresh?.();
-    }, 30_000);
-
-    return () => window.clearInterval(intervalId);
-  }, [enabled, onDashboardDataRefresh, refreshHistory, refreshMarketReviewHistory, refreshStockBar, refreshActiveTasks]);
-
-  useEffect(() => {
-    if (!enabled) {
-      return;
-    }
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        void refreshHistory(true);
-        void refreshStockBar();
-        void refreshMarketReviewHistory?.(true);
-        void refreshActiveTasks();
-        onDashboardDataRefresh?.();
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [enabled, onDashboardDataRefresh, refreshHistory, refreshMarketReviewHistory, refreshStockBar, refreshActiveTasks]);
+  useVisibilityAwarePolling({
+    callback: handlePeriodicRefresh,
+    intervalMs: 30_000,
+    enabled,
+    hiddenBehavior: 'pause',
+    immediate: false,
+    syncOnVisible: true,
+  });
 
   useEffect(() => {
     return () => {

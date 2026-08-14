@@ -2357,7 +2357,68 @@ describe('HomePage', () => {
     });
     expect(await screen.findByText('大盘复盘已完成')).toBeInTheDocument();
     expect(await screen.findByText('市场复盘报告示例文本')).toBeInTheDocument();
-    expect(analysisApi.getStatus).toHaveBeenCalledWith('task-1');
+    expect(analysisApi.getStatus).toHaveBeenCalledWith('task-1', expect.anything());
+  });
+
+  it('pauses market review polling while hidden and syncs immediately when visible', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, 'visibilityState', {
+      value: 'visible',
+      writable: true,
+      configurable: true,
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({ total: 0, page: 1, limit: 20, items: [] });
+    vi.mocked(analysisApi.triggerMarketReview).mockResolvedValue({
+      status: 'accepted',
+      sendNotification: true,
+      message: '大盘复盘任务已提交',
+      region: 'cn',
+      taskId: 'task-visibility',
+    });
+    vi.mocked(analysisApi.getStatus)
+      .mockResolvedValueOnce({ taskId: 'task-visibility', status: 'processing', progress: 20 })
+      .mockResolvedValueOnce({
+        taskId: 'task-visibility',
+        status: 'completed',
+        marketReviewReport: '前台同步完成',
+      });
+
+    try {
+      render(<MemoryRouter><HomePage /></MemoryRouter>);
+      fireEvent.click(screen.getByRole('button', { name: '大盘复盘' }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(analysisApi.getStatus).toHaveBeenCalledTimes(1);
+
+      act(() => {
+        Object.defineProperty(document, 'visibilityState', {
+          value: 'hidden',
+          writable: true,
+          configurable: true,
+        });
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(analysisApi.getStatus).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        Object.defineProperty(document, 'visibilityState', {
+          value: 'visible',
+          writable: true,
+          configurable: true,
+        });
+        document.dispatchEvent(new Event('visibilitychange'));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(analysisApi.getStatus).toHaveBeenCalledTimes(2);
+      expect(screen.getByText('前台同步完成')).toBeInTheDocument();
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 
   it('submits a one-time multi-market override without saving system config', async () => {

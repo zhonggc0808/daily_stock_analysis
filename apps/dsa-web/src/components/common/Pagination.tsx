@@ -1,4 +1,5 @@
 import type React from 'react';
+import { useUiLanguage } from '../../contexts/UiLanguageContext';
 import { cn } from '../../utils/cn';
 
 interface PageButtonProps {
@@ -7,9 +8,10 @@ interface PageButtonProps {
   disabled?: boolean;
   onClick?: () => void;
   children?: React.ReactNode;
+  ariaLabel?: string;
 }
 
-const PageButton: React.FC<PageButtonProps> = ({ page, isActive, disabled, onClick, children }) => {
+const PageButton: React.FC<PageButtonProps> = ({ page, isActive, disabled, onClick, children, ariaLabel }) => {
   const isEllipsis = page === '...';
 
   if (isEllipsis) {
@@ -21,6 +23,7 @@ const PageButton: React.FC<PageButtonProps> = ({ page, isActive, disabled, onCli
       type="button"
       onClick={onClick}
       disabled={disabled}
+      aria-label={ariaLabel}
       className={cn(
         'inline-flex h-10 min-w-[2.5rem] items-center justify-center rounded-xl border px-3 text-sm font-medium transition-all duration-200',
         isActive
@@ -50,6 +53,8 @@ export const Pagination: React.FC<PaginationProps> = ({
   onPageChange,
   className = '',
 }) => {
+  const { t } = useUiLanguage();
+
   if (totalPages <= 1) return null;
 
   // Build the page list with ellipsis placeholders.
@@ -79,6 +84,7 @@ export const Pagination: React.FC<PaginationProps> = ({
         page="prev"
         disabled={currentPage === 1}
         onClick={() => onPageChange(currentPage - 1)}
+        ariaLabel={t('pagination.previous')}
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
@@ -100,6 +106,7 @@ export const Pagination: React.FC<PaginationProps> = ({
         page="next"
         disabled={currentPage === totalPages}
         onClick={() => onPageChange(currentPage + 1)}
+        ariaLabel={t('pagination.next')}
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
